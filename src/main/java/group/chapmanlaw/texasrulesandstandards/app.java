@@ -48,21 +48,26 @@ import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
-import org.apache.pdfbox.Loader;
-import org.apache.pdfbox.multipdf.PDFMergerUtility;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.font.PDFont;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.pdmodel.interactive.action.PDActionGoTo;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationLink;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageFitWidthDestination;
+import org.apache.tika.exception.TikaException;
+import org.apache.tika.metadata.Metadata;
+import org.apache.tika.parser.ParseContext;
+import org.apache.tika.parser.pdf.PDFParser;
+import org.apache.tika.sax.BodyContentHandler;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.nodes.Node;
 import org.jsoup.nodes.TextNode;
+import org.xml.sax.SAXException;
 
 public class app {
 
@@ -77,6 +82,7 @@ public class app {
     private static final String STORAGE_ENGINE_LOCAL = "local";
     private static final String STORAGE_ENGINE_SFTP = "sftp";
     private static final String STORAGE_ENGINE_WEBDAV = "webdav";
+    private static final String TEXT_OUTPUT_DIRECTORY = "txt";
     private static final String COMBINED_NEW_FILE_NAME = "combined_new.pdf";
     private static final String COMBINED_PREVIOUS_FILE_NAME = "combined_previous.pdf";
     private static final Set<String> DOCUMENT_EXTENSIONS = Set.of("pdf", "doc", "docx");
@@ -142,6 +148,7 @@ public class app {
                         stats.updatedDocumentIds()
                 );
                 applyCombinedMetadata(updatedMetadata, combinedBuild, previousMetadata);
+                extractPdfTextArtifacts(documents, storageEngine, updatedMetadata, previousMetadata);
                 updatedMetadata.setProperty("storage.engine", storageEngine.name());
                 updatedMetadata.setProperty("storage.root", storageEngine.describeRoot());
                 writeMetadata(updatedMetadata);
@@ -394,6 +401,7 @@ public class app {
 
             String metadataPrefix = "doc." + document.id() + ".";
             String previousLastAmended = previousMetadata.getProperty(metadataPrefix + "lastAmended");
+            String previousUrl = previousMetadata.getProperty(metadataPrefix + "url");
             String previousMd5New = firstNonBlank(
                     previousMetadata.getProperty(metadataPrefix + "md5.new"),
                     previousMetadata.getProperty(metadataPrefix + "md5"));
@@ -410,13 +418,24 @@ public class app {
             }
             boolean shouldDownload;
             String reason;
+            boolean previousHasAmendmentDate = previousLastAmended != null && !previousLastAmended.isBlank();
+            boolean currentHasAmendmentDate = document.lastAmendedRaw() != null && !document.lastAmendedRaw().isBlank();
 
             if (!storedCopyExists) {
                 shouldDownload = true;
                 reason = "missing stored file";
-            } else if (previousLastAmended == null || previousLastAmended.isBlank()) {
+            } else if (!previousHasAmendmentDate && !currentHasAmendmentDate) {
+                String currentUrl = document.downloadUri().toString();
+                boolean sameUrl = previousUrl != null
+                        && !previousUrl.isBlank()
+                        && previousUrl.equalsIgnoreCase(currentUrl);
+                shouldDownload = !sameUrl;
+                reason = sameUrl
+                        ? "no amendment date and URL unchanged"
+                        : "no amendment date and URL changed";
+            } else if (!previousHasAmendmentDate) {
                 shouldDownload = true;
-                reason = "existing file has no stored amendment date";
+                reason = "source now provides an amendment date";
             } else if (isAmended(previousLastAmended, document.lastAmendedRaw(), document.lastAmended())) {
                 shouldDownload = true;
                 reason = "amendment date changed (stored: '" + previousLastAmended + "', current: '"
@@ -516,7 +535,7 @@ public class app {
             if (newSources.isEmpty()) {
                 LOGGER.warning("No PDF sources available for " + COMBINED_NEW_FILE_NAME + "; skipping build.");
             } else {
-                byte[] combinedNewBytes = createCombinedPdfWithToc(newSources, "Current Rule Sets");
+                byte[] combinedNewBytes = createCombinedPdfWithToc(newSources, "Texas Rule Sets and Standards - Current");
                 storageEngine.write(COMBINED_NEW_FILE_NAME, combinedNewBytes);
                 combinedNewMd5 = md5Hex(combinedNewBytes);
                 builtCombinedNew = true;
@@ -537,7 +556,10 @@ public class app {
             if (previousSources.isEmpty()) {
                 LOGGER.warning("No PDF sources available for " + COMBINED_PREVIOUS_FILE_NAME + "; skipping build.");
             } else {
-                byte[] combinedPreviousBytes = createCombinedPdfWithToc(previousSources, "Previous Rule Sets");
+                byte[] combinedPreviousBytes = createCombinedPdfWithToc(
+                        previousSources,
+                        "Texas Rule Sets and Standards - Previous"
+                );
                 storageEngine.write(COMBINED_PREVIOUS_FILE_NAME, combinedPreviousBytes);
                 combinedPreviousMd5 = md5Hex(combinedPreviousBytes);
                 builtCombinedPrevious = true;
@@ -606,7 +628,7 @@ public class app {
     private static byte[] createCombinedPdfWithToc(List<CombinedPdfSource> sources, String tocTitle) throws IOException {
         List<CombinedPdfSource> validSources = new ArrayList<>();
         for (CombinedPdfSource source : sources) {
-            try (PDDocument ignored = Loader.loadPDF(source.bytes())) {
+            try (PDDocument ignored = PDDocument.load(source.bytes())) {
                 validSources.add(source);
             } catch (IOException ex) {
                 LOGGER.warning("Skipping invalid PDF source for combine: " + source.fileName() + " (" + ex.getMessage() + ")");
@@ -621,25 +643,34 @@ public class app {
         int tocPageCount = Math.max(1, (int) Math.ceil(validSources.size() / (double) tocEntriesPerPage));
 
         try (PDDocument combinedDocument = new PDDocument()) {
-            for (int i = 0; i < tocPageCount; i++) {
-                combinedDocument.addPage(new PDPage(PDRectangle.LETTER));
-            }
-
-            PDFMergerUtility merger = new PDFMergerUtility();
-            List<TocEntry> tocEntries = new ArrayList<>();
-            for (CombinedPdfSource source : validSources) {
-                int startPageIndex = combinedDocument.getNumberOfPages();
-                try (PDDocument sourceDocument = Loader.loadPDF(source.bytes())) {
-                    merger.appendDocument(combinedDocument, sourceDocument);
+            List<PDDocument> openedSourceDocuments = new ArrayList<>();
+            try {
+                for (int i = 0; i < tocPageCount; i++) {
+                    combinedDocument.addPage(new PDPage(PDRectangle.LETTER));
                 }
-                tocEntries.add(new TocEntry(source.title(), startPageIndex));
+
+                List<TocEntry> tocEntries = new ArrayList<>();
+                for (CombinedPdfSource source : validSources) {
+                    int startPageIndex = combinedDocument.getNumberOfPages();
+                    PDDocument sourceDocument = PDDocument.load(source.bytes());
+                    openedSourceDocuments.add(sourceDocument);
+                    appendPdfPages(combinedDocument, sourceDocument);
+                    tocEntries.add(new TocEntry(source.title(), startPageIndex));
+                }
+
+                writeTocPages(combinedDocument, tocEntries, tocPageCount, tocTitle);
+
+                ByteArrayOutputStream output = new ByteArrayOutputStream();
+                combinedDocument.save(output);
+                return output.toByteArray();
+            } finally {
+                for (PDDocument sourceDocument : openedSourceDocuments) {
+                    try {
+                        sourceDocument.close();
+                    } catch (IOException ignored) {
+                    }
+                }
             }
-
-            writeTocPages(combinedDocument, tocEntries, tocPageCount, tocTitle);
-
-            ByteArrayOutputStream output = new ByteArrayOutputStream();
-            combinedDocument.save(output);
-            return output.toByteArray();
         }
     }
 
@@ -649,8 +680,8 @@ public class app {
             int tocPageCount,
             String tocTitle
     ) throws IOException {
-        PDType1Font titleFont = new PDType1Font(org.apache.pdfbox.pdmodel.font.Standard14Fonts.FontName.HELVETICA_BOLD);
-        PDType1Font entryFont = new PDType1Font(org.apache.pdfbox.pdmodel.font.Standard14Fonts.FontName.HELVETICA);
+        PDType1Font titleFont = PDType1Font.HELVETICA_BOLD;
+        PDType1Font entryFont = PDType1Font.HELVETICA;
 
         int entriesPerPage = calculateTocEntriesPerPage(PDRectangle.LETTER);
         int entryIndex = 0;
@@ -675,8 +706,16 @@ public class app {
 
                 for (int line = 0; line < entriesPerPage && entryIndex < tocEntries.size(); line++, entryIndex++) {
                     TocEntry entry = tocEntries.get(entryIndex);
-                    String leftText = sanitizePdfText((entryIndex + 1) + ". " + entry.title());
                     String pageText = Integer.toString(entry.targetPageIndex() + 1);
+                    float pageTextWidth = widthOfText(entryFont, TOC_ENTRY_FONT_SIZE, pageText);
+                    float pageTextX = pageSize.getWidth() - TOC_PAGE_MARGIN - pageTextWidth;
+                    float leftMaxWidth = Math.max(pageTextX - TOC_PAGE_MARGIN - 20f, 40f);
+                    String leftText = truncateTextToWidth(
+                            (entryIndex + 1) + ". " + entry.title(),
+                            entryFont,
+                            TOC_ENTRY_FONT_SIZE,
+                            leftMaxWidth
+                    );
 
                     contentStream.beginText();
                     contentStream.setFont(entryFont, TOC_ENTRY_FONT_SIZE);
@@ -684,8 +723,6 @@ public class app {
                     contentStream.showText(leftText);
                     contentStream.endText();
 
-                    float pageTextWidth = entryFont.getStringWidth(pageText) / 1000f * TOC_ENTRY_FONT_SIZE;
-                    float pageTextX = pageSize.getWidth() - TOC_PAGE_MARGIN - pageTextWidth;
                     contentStream.beginText();
                     contentStream.setFont(entryFont, TOC_ENTRY_FONT_SIZE);
                     contentStream.newLineAtOffset(pageTextX, y);
@@ -712,6 +749,18 @@ public class app {
         }
     }
 
+    private static void appendPdfPages(PDDocument destination, PDDocument source) throws IOException {
+        for (PDPage page : source.getPages()) {
+            PDPage imported = destination.importPage(page);
+            imported.setRotation(page.getRotation());
+            imported.setMediaBox(page.getMediaBox());
+            imported.setCropBox(page.getCropBox());
+            imported.setBleedBox(page.getBleedBox());
+            imported.setTrimBox(page.getTrimBox());
+            imported.setArtBox(page.getArtBox());
+        }
+    }
+
     private static int calculateTocEntriesPerPage(PDRectangle pageSize) {
         float availableHeight = pageSize.getHeight()
                 - (TOC_PAGE_MARGIN * 2f)
@@ -726,6 +775,33 @@ public class app {
             return "";
         }
         return value.replaceAll("[^\\x20-\\x7E]", "?");
+    }
+
+    private static String truncateTextToWidth(String value, PDFont font, float fontSize, float maxWidth) throws IOException {
+        String text = sanitizePdfText(value);
+        if (widthOfText(font, fontSize, text) <= maxWidth) {
+            return text;
+        }
+
+        String ellipsis = "...";
+        float ellipsisWidth = widthOfText(font, fontSize, ellipsis);
+        if (ellipsisWidth >= maxWidth) {
+            return ellipsis;
+        }
+
+        int end = text.length();
+        while (end > 0) {
+            String candidate = text.substring(0, end) + ellipsis;
+            if (widthOfText(font, fontSize, candidate) <= maxWidth) {
+                return candidate;
+            }
+            end--;
+        }
+        return ellipsis;
+    }
+
+    private static float widthOfText(PDFont font, float fontSize, String text) throws IOException {
+        return font.getStringWidth(text) / 1000f * fontSize;
     }
 
     private static void applyCombinedMetadata(
@@ -758,6 +834,191 @@ public class app {
                         ? Instant.now().toString()
                         : previousMetadata.getProperty("combined.previous.lastBuiltAt")
         );
+    }
+
+    private static void extractPdfTextArtifacts(
+            List<DocumentRecord> documents,
+            StorageEngine storageEngine,
+            Properties updatedMetadata,
+            Properties previousMetadata
+    ) {
+        LOGGER.info("Ensuring .txt extraction artifacts for PDF files.");
+
+        for (DocumentRecord document : documents) {
+            if (!document.isPdf()) {
+                continue;
+            }
+
+            String docPrefix = "doc." + document.id() + ".";
+            String newPdfMd5 = updatedMetadata.getProperty(docPrefix + "md5.new");
+            ensureTextArtifact(
+                    storageEngine,
+                    updatedMetadata,
+                    previousMetadata,
+                    docPrefix + "txt.new",
+                    document.fileName(),
+                    newPdfMd5
+            );
+
+            if (document.previousFileName() != null) {
+                String previousPdfMd5 = updatedMetadata.getProperty(docPrefix + "md5.previous");
+                ensureTextArtifact(
+                        storageEngine,
+                        updatedMetadata,
+                        previousMetadata,
+                        docPrefix + "txt.previous",
+                        document.previousFileName(),
+                        previousPdfMd5
+                );
+            } else {
+                clearTextArtifactMetadata(updatedMetadata, docPrefix + "txt.previous");
+            }
+        }
+
+        ensureTextArtifact(
+                storageEngine,
+                updatedMetadata,
+                previousMetadata,
+                "combined.new.txt",
+                COMBINED_NEW_FILE_NAME,
+                updatedMetadata.getProperty("combined.new.md5")
+        );
+        ensureTextArtifact(
+                storageEngine,
+                updatedMetadata,
+                previousMetadata,
+                "combined.previous.txt",
+                COMBINED_PREVIOUS_FILE_NAME,
+                updatedMetadata.getProperty("combined.previous.md5")
+        );
+    }
+
+    private static void ensureTextArtifact(
+            StorageEngine storageEngine,
+            Properties updatedMetadata,
+            Properties previousMetadata,
+            String metadataPrefix,
+            String pdfFileName,
+            String pdfMd5
+    ) {
+        try {
+            if (pdfFileName == null || pdfFileName.isBlank() || pdfMd5 == null || pdfMd5.isBlank() || !storageEngine.exists(pdfFileName)) {
+                clearTextArtifactMetadata(updatedMetadata, metadataPrefix);
+                return;
+            }
+
+            String textFileName = toTextFileName(pdfFileName);
+            String previousSourceMd5 = previousMetadata.getProperty(metadataPrefix + ".sourceMd5");
+            String previousTextMd5 = previousMetadata.getProperty(metadataPrefix + ".md5");
+            String previousLastExtractedAt = previousMetadata.getProperty(metadataPrefix + ".lastExtractedAt");
+            boolean needsExtraction = !storageEngine.exists(textFileName) || !pdfMd5.equals(previousSourceMd5);
+
+            String textMd5;
+            if (needsExtraction) {
+                LOGGER.info("Extracting text to " + textFileName + " from " + pdfFileName);
+                byte[] pdfBytes = storageEngine.read(pdfFileName);
+                byte[] textBytes = extractPdfTextWithPageMarkers(pdfBytes).getBytes(StandardCharsets.UTF_8);
+                storageEngine.write(textFileName, textBytes);
+                textMd5 = md5Hex(textBytes);
+                updatedMetadata.setProperty(metadataPrefix + ".lastExtractedAt", Instant.now().toString());
+            } else {
+                textMd5 = firstNonBlank(previousTextMd5, computeStoredMd5IfPresent(storageEngine, textFileName));
+                setOptionalProperty(updatedMetadata, metadataPrefix + ".lastExtractedAt", previousLastExtractedAt);
+            }
+
+            updatedMetadata.setProperty(metadataPrefix + ".fileName", textFileName);
+            updatedMetadata.setProperty(metadataPrefix + ".sourceMd5", pdfMd5);
+            setOptionalProperty(updatedMetadata, metadataPrefix + ".md5", textMd5);
+        } catch (IOException ex) {
+            LOGGER.warning("Unable to extract text artifact for '" + pdfFileName + "': " + ex.getMessage());
+            String previousSourceMd5 = previousMetadata.getProperty(metadataPrefix + ".sourceMd5");
+            if (previousSourceMd5 != null && !previousSourceMd5.isBlank()) {
+                for (String key : previousMetadata.stringPropertyNames()) {
+                    if (key.startsWith(metadataPrefix + ".")) {
+                        updatedMetadata.setProperty(key, previousMetadata.getProperty(key, ""));
+                    }
+                }
+            } else {
+                clearTextArtifactMetadata(updatedMetadata, metadataPrefix);
+            }
+        }
+    }
+
+    private static void clearTextArtifactMetadata(Properties metadata, String metadataPrefix) {
+        metadata.remove(metadataPrefix + ".fileName");
+        metadata.remove(metadataPrefix + ".sourceMd5");
+        metadata.remove(metadataPrefix + ".md5");
+        metadata.remove(metadataPrefix + ".lastExtractedAt");
+    }
+
+    private static String toTextFileName(String pdfFileName) {
+        String normalized = pdfFileName.replace('\\', '/');
+        while (normalized.startsWith("/")) {
+            normalized = normalized.substring(1);
+        }
+        String lower = normalized.toLowerCase(Locale.US);
+        if (lower.endsWith(".pdf")) {
+            normalized = normalized.substring(0, normalized.length() - 4) + ".txt";
+        } else {
+            normalized = normalized + ".txt";
+        }
+        return TEXT_OUTPUT_DIRECTORY + "/" + normalized;
+    }
+
+    private static String extractPdfTextWithPageMarkers(byte[] pdfBytes) throws IOException {
+        PDFParser parser = new PDFParser();
+        StringBuilder output = new StringBuilder();
+
+        try (PDDocument pdDocument = PDDocument.load(pdfBytes)) {
+            int pageCount = pdDocument.getNumberOfPages();
+            for (int page = 1; page <= pageCount; page++) {
+                ParseContext parseContext = new ParseContext();
+                BodyContentHandler handler = new BodyContentHandler(-1);
+                Metadata metadata = new Metadata();
+                byte[] singlePagePdf = extractSinglePdfPage(pdDocument, page - 1);
+                try (ByteArrayInputStream input = new ByteArrayInputStream(singlePagePdf)) {
+                    parser.parse(input, handler, metadata, parseContext);
+                } catch (TikaException | SAXException ex) {
+                    throw new IOException("Tika parsing failed for PDF page " + page, ex);
+                }
+
+                output.append("===== PDF PAGE ").append(page).append(" =====").append(System.lineSeparator());
+                String pageText = normalizeExtractedText(handler.toString());
+                if (pageText.isBlank()) {
+                    output.append("[No extractable text]").append(System.lineSeparator());
+                } else {
+                    output.append(pageText).append(System.lineSeparator());
+                }
+                output.append(System.lineSeparator());
+            }
+        }
+
+        return output.toString();
+    }
+
+    private static byte[] extractSinglePdfPage(PDDocument sourceDocument, int zeroBasedPageIndex) throws IOException {
+        try (PDDocument singlePageDocument = new PDDocument()) {
+            PDPage sourcePage = sourceDocument.getPage(zeroBasedPageIndex);
+            PDPage imported = singlePageDocument.importPage(sourcePage);
+            imported.setRotation(sourcePage.getRotation());
+            imported.setMediaBox(sourcePage.getMediaBox());
+            imported.setCropBox(sourcePage.getCropBox());
+            imported.setBleedBox(sourcePage.getBleedBox());
+            imported.setTrimBox(sourcePage.getTrimBox());
+            imported.setArtBox(sourcePage.getArtBox());
+
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            singlePageDocument.save(output);
+            return output.toByteArray();
+        }
+    }
+
+    private static String normalizeExtractedText(String value) {
+        if (value == null) {
+            return "";
+        }
+        String normalized = value.replace("\r\n", "\n").replace('\r', '\n').trim();
+        return normalized;
     }
 
     private static byte[] downloadDocument(HttpClient httpClient, URI documentUri) throws IOException, InterruptedException {
@@ -1275,6 +1536,10 @@ public class app {
         @Override
         public void write(String fileName, byte[] bytes) throws IOException {
             Path destinationPath = rootDirectory.resolve(fileName);
+            Path parentDirectory = destinationPath.getParent();
+            if (parentDirectory != null) {
+                Files.createDirectories(parentDirectory);
+            }
             Path tempFile = Files.createTempFile(rootDirectory, "rules-standards-", ".tmp");
             try {
                 Files.write(tempFile, bytes, StandardOpenOption.TRUNCATE_EXISTING);
@@ -1372,7 +1637,13 @@ public class app {
         @Override
         public void write(String fileName, byte[] bytes) throws IOException {
             String targetPath = remotePath(fileName);
+            String parentDirectoryPath = parentDirectory(targetPath);
             String tempPath = targetPath + ".tmp-" + Instant.now().toEpochMilli();
+            try {
+                ensureRemoteDirectory(channel, parentDirectoryPath);
+            } catch (SftpException ex) {
+                throw new IOException("Unable to create remote directory '" + parentDirectoryPath + "'.", ex);
+            }
             try (ByteArrayInputStream input = new ByteArrayInputStream(bytes)) {
                 channel.put(input, tempPath, ChannelSftp.OVERWRITE);
                 try {
@@ -1417,6 +1688,14 @@ public class app {
                 channel.rm(tempPath);
             } catch (SftpException ignored) {
             }
+        }
+
+        private static String parentDirectory(String absolutePath) {
+            int index = absolutePath.lastIndexOf('/');
+            if (index <= 0) {
+                return "/";
+            }
+            return absolutePath.substring(0, index);
         }
 
         private static String ensureRemoteDirectory(ChannelSftp channel, String remoteDirectory) throws SftpException {
@@ -1519,7 +1798,9 @@ public class app {
 
         @Override
         public void write(String fileName, byte[] bytes) throws IOException {
-            String targetUrl = urlForPath(remotePath(fileName));
+            String targetPath = remotePath(fileName);
+            ensureDirectoryPathExists(parentDirectory(targetPath));
+            String targetUrl = urlForPath(targetPath);
             int statusCode = sendWithBody("PUT", targetUrl, bytes);
             if (!isSuccessStatus(statusCode)) {
                 throw new IOException("WebDAV PUT failed with HTTP status " + statusCode + " for " + targetUrl);
@@ -1527,11 +1808,15 @@ public class app {
         }
 
         private void ensureRemoteDirectoryExists() throws IOException {
-            if ("/".equals(remoteRoot)) {
+            ensureDirectoryPathExists(remoteRoot);
+        }
+
+        private void ensureDirectoryPathExists(String absoluteDirectoryPath) throws IOException {
+            if (absoluteDirectoryPath == null || absoluteDirectoryPath.isBlank() || "/".equals(absoluteDirectoryPath)) {
                 return;
             }
 
-            String[] parts = remoteRoot.substring(1).split("/");
+            String[] parts = absoluteDirectoryPath.substring(1).split("/");
             StringBuilder currentPath = new StringBuilder();
             for (String part : parts) {
                 if (part.isBlank()) {
@@ -1546,6 +1831,14 @@ public class app {
                 throw new IOException(
                         "WebDAV MKCOL failed with HTTP status " + statusCode + " while creating " + currentPath);
             }
+        }
+
+        private static String parentDirectory(String absolutePath) {
+            int index = absolutePath.lastIndexOf('/');
+            if (index <= 0) {
+                return "/";
+            }
+            return absolutePath.substring(0, index);
         }
 
         private int sendWithoutBody(String method, String url, boolean propfindDepthZero) throws IOException {
