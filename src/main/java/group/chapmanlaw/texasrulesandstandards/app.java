@@ -6,6 +6,7 @@ import com.jcraft.jsch.JSchException;
 import com.jcraft.jsch.Session;
 import com.jcraft.jsch.SftpException;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.StringReader;
 import java.io.StringWriter;
@@ -13,6 +14,8 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -27,6 +30,7 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -34,6 +38,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.Base64;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.logging.ConsoleHandler;
@@ -43,6 +48,16 @@ import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
+import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.multipdf.PDFMergerUtility;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.font.PDType1Font;
+import org.apache.pdfbox.pdmodel.interactive.action.PDActionGoTo;
+import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationLink;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageFitWidthDestination;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
@@ -61,6 +76,9 @@ public class app {
     private static final String STANDARDS_SECTION_HEADING = "Statewide Standards";
     private static final String STORAGE_ENGINE_LOCAL = "local";
     private static final String STORAGE_ENGINE_SFTP = "sftp";
+    private static final String STORAGE_ENGINE_WEBDAV = "webdav";
+    private static final String COMBINED_NEW_FILE_NAME = "combined_new.pdf";
+    private static final String COMBINED_PREVIOUS_FILE_NAME = "combined_previous.pdf";
     private static final Set<String> DOCUMENT_EXTENSIONS = Set.of("pdf", "doc", "docx");
     private static final String HTTP_USER_AGENT = "texas-rules-and-standards-sync/1.0 (+https://www.txcourts.gov/)";
     private static final Pattern DATE_PATTERN = Pattern.compile(
@@ -69,6 +87,10 @@ public class app {
             "<a\\b[^>]*href\\s*=\\s*['\"]([^'\"]+)['\"][^>]*>(.*?)</a>",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
     private static final DateTimeFormatter LAST_AMENDED_FORMAT = DateTimeFormatter.ofPattern("MMMM d, uuuu", Locale.US);
+    private static final float TOC_PAGE_MARGIN = 50f;
+    private static final float TOC_LINE_HEIGHT = 16f;
+    private static final float TOC_TITLE_FONT_SIZE = 20f;
+    private static final float TOC_ENTRY_FONT_SIZE = 12f;
     private static final Logger LOGGER = Logger.getLogger(app.class.getName());
 
     public static void main(String[] args) {
@@ -84,6 +106,8 @@ public class app {
             LOGGER.info("Configured storage engine: " + storageSettings.engine());
             if (STORAGE_ENGINE_SFTP.equals(storageSettings.engine())) {
                 LOGGER.info("Configured SFTP endpoint: " + storageSettings.sftpEndpoint());
+            } else if (STORAGE_ENGINE_WEBDAV.equals(storageSettings.engine())) {
+                LOGGER.info("Configured WebDAV endpoint: " + storageSettings.webDavEndpoint());
             }
 
             Properties previousMetadata = loadMetadata();
@@ -111,6 +135,13 @@ public class app {
 
                 Properties updatedMetadata = new Properties();
                 SyncStats stats = syncDocuments(httpClient, documents, previousMetadata, updatedMetadata, storageEngine);
+                CombinedBuildResult combinedBuild = buildCombinedPdfs(
+                        documents,
+                        storageEngine,
+                        stats.downloaded() > 0,
+                        stats.updatedDocumentIds()
+                );
+                applyCombinedMetadata(updatedMetadata, combinedBuild, previousMetadata);
                 updatedMetadata.setProperty("storage.engine", storageEngine.name());
                 updatedMetadata.setProperty("storage.root", storageEngine.describeRoot());
                 writeMetadata(updatedMetadata);
@@ -133,26 +164,39 @@ public class app {
         if (STORAGE_ENGINE_LOCAL.equals(configuredEngine)) {
             return StorageSettings.local();
         }
-        if (!STORAGE_ENGINE_SFTP.equals(configuredEngine)) {
-            throw new IllegalArgumentException(
-                    "Unsupported storage engine '" + configuredEngine + "'. Supported values: local, sftp.");
+        if (STORAGE_ENGINE_SFTP.equals(configuredEngine)) {
+            String host = readRequiredConfig("storage.sftp.host", "SFTP_HOST");
+            int port = parsePositiveInt(readConfig("storage.sftp.port", "SFTP_PORT", "22"), "storage.sftp.port/SFTP_PORT");
+            String username = readRequiredConfig("storage.sftp.username", "SFTP_USERNAME");
+            String password = readRequiredConfig("storage.sftp.password", "SFTP_PASSWORD");
+            String remoteDirectory = normalizeRemoteDirectory(
+                    readConfig("storage.sftp.remoteDir", "SFTP_REMOTE_DIR", "/texas-rules-and-standards"));
+            int timeoutSeconds = parsePositiveInt(
+                    readConfig("storage.sftp.timeoutSeconds", "SFTP_TIMEOUT_SECONDS", "30"),
+                    "storage.sftp.timeoutSeconds/SFTP_TIMEOUT_SECONDS");
+            return StorageSettings.sftp(host, port, username, password, remoteDirectory, timeoutSeconds);
         }
-
-        String host = readRequiredConfig("storage.sftp.host", "SFTP_HOST");
-        int port = parsePositiveInt(readConfig("storage.sftp.port", "SFTP_PORT", "22"), "storage.sftp.port/SFTP_PORT");
-        String username = readRequiredConfig("storage.sftp.username", "SFTP_USERNAME");
-        String password = readRequiredConfig("storage.sftp.password", "SFTP_PASSWORD");
-        String remoteDirectory = normalizeRemoteDirectory(
-                readConfig("storage.sftp.remoteDir", "SFTP_REMOTE_DIR", "/texas-rules-and-standards"));
-        int timeoutSeconds = parsePositiveInt(
-                readConfig("storage.sftp.timeoutSeconds", "SFTP_TIMEOUT_SECONDS", "30"),
-                "storage.sftp.timeoutSeconds/SFTP_TIMEOUT_SECONDS");
-        return new StorageSettings(configuredEngine, host, port, username, password, remoteDirectory, timeoutSeconds);
+        if (STORAGE_ENGINE_WEBDAV.equals(configuredEngine)) {
+            String baseUrl = normalizeWebDavBaseUrl(readRequiredConfig("storage.webdav.baseUrl", "WEBDAV_BASE_URL"));
+            String username = readRequiredConfig("storage.webdav.username", "WEBDAV_USERNAME");
+            String password = readRequiredConfig("storage.webdav.password", "WEBDAV_PASSWORD");
+            String remoteDirectory = normalizeRemoteDirectory(
+                    readConfig("storage.webdav.remoteDir", "WEBDAV_REMOTE_DIR", "/texas-rules-and-standards"));
+            int timeoutSeconds = parsePositiveInt(
+                    readConfig("storage.webdav.timeoutSeconds", "WEBDAV_TIMEOUT_SECONDS", "30"),
+                    "storage.webdav.timeoutSeconds/WEBDAV_TIMEOUT_SECONDS");
+            return StorageSettings.webDav(baseUrl, username, password, remoteDirectory, timeoutSeconds);
+        }
+        throw new IllegalArgumentException(
+                "Unsupported storage engine '" + configuredEngine + "'. Supported values: local, sftp, webdav.");
     }
 
     private static StorageEngine createStorageEngine(StorageSettings settings) throws IOException {
         if (STORAGE_ENGINE_SFTP.equals(settings.engine())) {
             return new SftpStorageEngine(settings);
+        }
+        if (STORAGE_ENGINE_WEBDAV.equals(settings.engine())) {
+            return new WebDavStorageEngine(settings);
         }
         return new LocalStorageEngine(DATA_DIRECTORY);
     }
@@ -338,6 +382,7 @@ public class app {
         int updated = 0;
         int skipped = 0;
         int failed = 0;
+        Set<String> updatedDocumentIds = new LinkedHashSet<>();
 
         Set<String> ids = new LinkedHashSet<>();
         for (DocumentRecord document : documents) {
@@ -349,8 +394,20 @@ public class app {
 
             String metadataPrefix = "doc." + document.id() + ".";
             String previousLastAmended = previousMetadata.getProperty(metadataPrefix + "lastAmended");
+            String previousMd5New = firstNonBlank(
+                    previousMetadata.getProperty(metadataPrefix + "md5.new"),
+                    previousMetadata.getProperty(metadataPrefix + "md5"));
+            String previousMd5Previous = previousMetadata.getProperty(metadataPrefix + "md5.previous");
 
             boolean storedCopyExists = storageEngine.exists(document);
+            if ((previousMd5New == null || previousMd5New.isBlank()) && storedCopyExists) {
+                previousMd5New = md5Hex(storageEngine.read(document.fileName()));
+            }
+            if ((previousMd5Previous == null || previousMd5Previous.isBlank())
+                    && document.previousFileName() != null
+                    && storageEngine.exists(document.previousFileName())) {
+                previousMd5Previous = md5Hex(storageEngine.read(document.previousFileName()));
+            }
             boolean shouldDownload;
             String reason;
 
@@ -374,13 +431,29 @@ public class app {
                 try {
                     boolean isUpdate = storedCopyExists;
                     byte[] bytes = downloadDocument(httpClient, document.downloadUri());
+                    String md5PreviousVersion = previousMd5Previous;
+                    if (isUpdate) {
+                        storageEngine.preservePrevious(document);
+                        if (document.previousFileName() != null && storageEngine.exists(document.previousFileName())) {
+                            md5PreviousVersion = md5Hex(storageEngine.read(document.previousFileName()));
+                        }
+                    }
                     storageEngine.write(document, bytes);
+                    String md5NewVersion = md5Hex(bytes);
                     downloaded++;
                     if (isUpdate) {
                         updated++;
+                        updatedDocumentIds.add(document.id());
                     }
                     LOGGER.info("  Result: download+store succeeded (" + bytes.length + " bytes)");
-                    updateMetadataEntry(updatedMetadata, metadataPrefix, document, storageEngine);
+                    updateMetadataEntry(
+                            updatedMetadata,
+                            metadataPrefix,
+                            document,
+                            storageEngine,
+                            md5NewVersion,
+                            md5PreviousVersion
+                    );
                 } catch (IOException | InterruptedException ex) {
                     failed++;
                     LOGGER.log(Level.SEVERE, "  Result: download+store failed for '" + document.title() + "'", ex);
@@ -393,7 +466,14 @@ public class app {
             } else {
                 skipped++;
                 LOGGER.info("  Action: skip (" + reason + ")");
-                updateMetadataEntry(updatedMetadata, metadataPrefix, document, storageEngine);
+                updateMetadataEntry(
+                        updatedMetadata,
+                        metadataPrefix,
+                        document,
+                        storageEngine,
+                        previousMd5New,
+                        previousMd5Previous
+                );
             }
         }
 
@@ -402,7 +482,282 @@ public class app {
         updatedMetadata.setProperty("source.page", SOURCE_PAGE_URI.toString());
         updatedMetadata.setProperty("source.lastCheckedAt", Instant.now().toString());
 
-        return new SyncStats(downloaded, updated, skipped, failed);
+        return new SyncStats(downloaded, updated, skipped, failed, updatedDocumentIds);
+    }
+
+    private static CombinedBuildResult buildCombinedPdfs(
+            List<DocumentRecord> documents,
+            StorageEngine storageEngine,
+            boolean hadDownloads,
+            Set<String> updatedDocumentIds
+    ) throws IOException {
+        boolean hadUpdates = updatedDocumentIds != null && !updatedDocumentIds.isEmpty();
+        List<DocumentRecord> pdfDocuments = new ArrayList<>();
+        for (DocumentRecord document : documents) {
+            if (document.isPdf()) {
+                pdfDocuments.add(document);
+            }
+        }
+
+        if (pdfDocuments.isEmpty()) {
+            LOGGER.info("No PDF documents discovered; skipping combined PDF generation.");
+            return CombinedBuildResult.none();
+        }
+
+        String combinedNewMd5 = null;
+        String combinedPreviousMd5 = null;
+        boolean builtCombinedNew = false;
+        boolean builtCombinedPrevious = false;
+
+        boolean combinedNewExists = storageEngine.exists(COMBINED_NEW_FILE_NAME);
+        boolean shouldBuildCombinedNew = hadDownloads || hadUpdates || !combinedNewExists;
+        if (shouldBuildCombinedNew) {
+            List<CombinedPdfSource> newSources = collectCombinedSources(pdfDocuments, storageEngine, false, updatedDocumentIds);
+            if (newSources.isEmpty()) {
+                LOGGER.warning("No PDF sources available for " + COMBINED_NEW_FILE_NAME + "; skipping build.");
+            } else {
+                byte[] combinedNewBytes = createCombinedPdfWithToc(newSources, "Current Rule Sets");
+                storageEngine.write(COMBINED_NEW_FILE_NAME, combinedNewBytes);
+                combinedNewMd5 = md5Hex(combinedNewBytes);
+                builtCombinedNew = true;
+                LOGGER.info("Built " + COMBINED_NEW_FILE_NAME + " from " + newSources.size() + " PDF(s).");
+            }
+        } else {
+            LOGGER.info("Skipping " + COMBINED_NEW_FILE_NAME + " rebuild; no relevant changes detected.");
+            combinedNewMd5 = computeStoredMd5IfPresent(storageEngine, COMBINED_NEW_FILE_NAME);
+        }
+
+        if (hadUpdates) {
+            List<CombinedPdfSource> previousSources = collectCombinedSources(
+                    pdfDocuments,
+                    storageEngine,
+                    true,
+                    updatedDocumentIds
+            );
+            if (previousSources.isEmpty()) {
+                LOGGER.warning("No PDF sources available for " + COMBINED_PREVIOUS_FILE_NAME + "; skipping build.");
+            } else {
+                byte[] combinedPreviousBytes = createCombinedPdfWithToc(previousSources, "Previous Rule Sets");
+                storageEngine.write(COMBINED_PREVIOUS_FILE_NAME, combinedPreviousBytes);
+                combinedPreviousMd5 = md5Hex(combinedPreviousBytes);
+                builtCombinedPrevious = true;
+                LOGGER.info("Built " + COMBINED_PREVIOUS_FILE_NAME + " from " + previousSources.size() + " PDF(s).");
+            }
+        } else {
+            LOGGER.info("Skipping " + COMBINED_PREVIOUS_FILE_NAME + "; no rule-set updates detected.");
+            combinedPreviousMd5 = computeStoredMd5IfPresent(storageEngine, COMBINED_PREVIOUS_FILE_NAME);
+        }
+
+        if (combinedNewMd5 == null) {
+            combinedNewMd5 = computeStoredMd5IfPresent(storageEngine, COMBINED_NEW_FILE_NAME);
+        }
+        if (combinedPreviousMd5 == null) {
+            combinedPreviousMd5 = computeStoredMd5IfPresent(storageEngine, COMBINED_PREVIOUS_FILE_NAME);
+        }
+
+        return new CombinedBuildResult(
+                builtCombinedNew,
+                combinedNewMd5,
+                builtCombinedPrevious,
+                combinedPreviousMd5
+        );
+    }
+
+    private static List<CombinedPdfSource> collectCombinedSources(
+            List<DocumentRecord> pdfDocuments,
+            StorageEngine storageEngine,
+            boolean preferPrevious,
+            Set<String> updatedDocumentIds
+    ) throws IOException {
+        List<CombinedPdfSource> sources = new ArrayList<>();
+        for (DocumentRecord document : pdfDocuments) {
+            String selectedFileName = document.fileName();
+            boolean shouldUsePrevious = preferPrevious
+                    && updatedDocumentIds != null
+                    && updatedDocumentIds.contains(document.id())
+                    && document.previousFileName() != null
+                    && storageEngine.exists(document.previousFileName());
+
+            if (shouldUsePrevious) {
+                selectedFileName = document.previousFileName();
+            } else if (!storageEngine.exists(selectedFileName)) {
+                LOGGER.warning("Missing PDF source for combined file: " + storageEngine.describeTarget(selectedFileName));
+                continue;
+            }
+
+            byte[] bytes = storageEngine.read(selectedFileName);
+            sources.add(new CombinedPdfSource(document.title(), selectedFileName, bytes));
+        }
+        return sources;
+    }
+
+    private static String computeStoredMd5IfPresent(StorageEngine storageEngine, String fileName) {
+        try {
+            if (!storageEngine.exists(fileName)) {
+                return null;
+            }
+            return md5Hex(storageEngine.read(fileName));
+        } catch (IOException ex) {
+            LOGGER.warning("Unable to compute MD5 for " + fileName + ": " + ex.getMessage());
+            return null;
+        }
+    }
+
+    private static byte[] createCombinedPdfWithToc(List<CombinedPdfSource> sources, String tocTitle) throws IOException {
+        List<CombinedPdfSource> validSources = new ArrayList<>();
+        for (CombinedPdfSource source : sources) {
+            try (PDDocument ignored = Loader.loadPDF(source.bytes())) {
+                validSources.add(source);
+            } catch (IOException ex) {
+                LOGGER.warning("Skipping invalid PDF source for combine: " + source.fileName() + " (" + ex.getMessage() + ")");
+            }
+        }
+
+        if (validSources.isEmpty()) {
+            throw new IOException("No valid PDF sources were available for combined PDF generation.");
+        }
+
+        int tocEntriesPerPage = calculateTocEntriesPerPage(PDRectangle.LETTER);
+        int tocPageCount = Math.max(1, (int) Math.ceil(validSources.size() / (double) tocEntriesPerPage));
+
+        try (PDDocument combinedDocument = new PDDocument()) {
+            for (int i = 0; i < tocPageCount; i++) {
+                combinedDocument.addPage(new PDPage(PDRectangle.LETTER));
+            }
+
+            PDFMergerUtility merger = new PDFMergerUtility();
+            List<TocEntry> tocEntries = new ArrayList<>();
+            for (CombinedPdfSource source : validSources) {
+                int startPageIndex = combinedDocument.getNumberOfPages();
+                try (PDDocument sourceDocument = Loader.loadPDF(source.bytes())) {
+                    merger.appendDocument(combinedDocument, sourceDocument);
+                }
+                tocEntries.add(new TocEntry(source.title(), startPageIndex));
+            }
+
+            writeTocPages(combinedDocument, tocEntries, tocPageCount, tocTitle);
+
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            combinedDocument.save(output);
+            return output.toByteArray();
+        }
+    }
+
+    private static void writeTocPages(
+            PDDocument combinedDocument,
+            List<TocEntry> tocEntries,
+            int tocPageCount,
+            String tocTitle
+    ) throws IOException {
+        PDType1Font titleFont = new PDType1Font(org.apache.pdfbox.pdmodel.font.Standard14Fonts.FontName.HELVETICA_BOLD);
+        PDType1Font entryFont = new PDType1Font(org.apache.pdfbox.pdmodel.font.Standard14Fonts.FontName.HELVETICA);
+
+        int entriesPerPage = calculateTocEntriesPerPage(PDRectangle.LETTER);
+        int entryIndex = 0;
+        for (int tocPageIndex = 0; tocPageIndex < tocPageCount; tocPageIndex++) {
+            PDPage tocPage = combinedDocument.getPage(tocPageIndex);
+            PDRectangle pageSize = tocPage.getMediaBox();
+            float y = pageSize.getHeight() - TOC_PAGE_MARGIN;
+
+            try (PDPageContentStream contentStream = new PDPageContentStream(
+                    combinedDocument,
+                    tocPage,
+                    PDPageContentStream.AppendMode.OVERWRITE,
+                    false
+            )) {
+                String title = tocPageIndex == 0 ? tocTitle : tocTitle + " (continued)";
+                contentStream.beginText();
+                contentStream.setFont(titleFont, TOC_TITLE_FONT_SIZE);
+                contentStream.newLineAtOffset(TOC_PAGE_MARGIN, y);
+                contentStream.showText(sanitizePdfText(title));
+                contentStream.endText();
+                y -= TOC_TITLE_FONT_SIZE + TOC_LINE_HEIGHT;
+
+                for (int line = 0; line < entriesPerPage && entryIndex < tocEntries.size(); line++, entryIndex++) {
+                    TocEntry entry = tocEntries.get(entryIndex);
+                    String leftText = sanitizePdfText((entryIndex + 1) + ". " + entry.title());
+                    String pageText = Integer.toString(entry.targetPageIndex() + 1);
+
+                    contentStream.beginText();
+                    contentStream.setFont(entryFont, TOC_ENTRY_FONT_SIZE);
+                    contentStream.newLineAtOffset(TOC_PAGE_MARGIN, y);
+                    contentStream.showText(leftText);
+                    contentStream.endText();
+
+                    float pageTextWidth = entryFont.getStringWidth(pageText) / 1000f * TOC_ENTRY_FONT_SIZE;
+                    float pageTextX = pageSize.getWidth() - TOC_PAGE_MARGIN - pageTextWidth;
+                    contentStream.beginText();
+                    contentStream.setFont(entryFont, TOC_ENTRY_FONT_SIZE);
+                    contentStream.newLineAtOffset(pageTextX, y);
+                    contentStream.showText(pageText);
+                    contentStream.endText();
+
+                    PDAnnotationLink link = new PDAnnotationLink();
+                    link.setRectangle(new PDRectangle(
+                            TOC_PAGE_MARGIN,
+                            y - 2f,
+                            pageSize.getWidth() - (TOC_PAGE_MARGIN * 2f),
+                            TOC_LINE_HEIGHT
+                    ));
+                    PDActionGoTo action = new PDActionGoTo();
+                    PDPageFitWidthDestination destination = new PDPageFitWidthDestination();
+                    destination.setPage(combinedDocument.getPage(entry.targetPageIndex()));
+                    action.setDestination(destination);
+                    link.setAction(action);
+                    tocPage.getAnnotations().add(link);
+
+                    y -= TOC_LINE_HEIGHT;
+                }
+            }
+        }
+    }
+
+    private static int calculateTocEntriesPerPage(PDRectangle pageSize) {
+        float availableHeight = pageSize.getHeight()
+                - (TOC_PAGE_MARGIN * 2f)
+                - TOC_TITLE_FONT_SIZE
+                - TOC_LINE_HEIGHT;
+        int entries = (int) Math.floor(availableHeight / TOC_LINE_HEIGHT);
+        return Math.max(entries, 1);
+    }
+
+    private static String sanitizePdfText(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value.replaceAll("[^\\x20-\\x7E]", "?");
+    }
+
+    private static void applyCombinedMetadata(
+            Properties updatedMetadata,
+            CombinedBuildResult combinedBuild,
+            Properties previousMetadata
+    ) {
+        updatedMetadata.setProperty("combined.new.fileName", COMBINED_NEW_FILE_NAME);
+        setOptionalProperty(
+                updatedMetadata,
+                "combined.new.md5",
+                firstNonBlank(combinedBuild.combinedNewMd5(), previousMetadata.getProperty("combined.new.md5"))
+        );
+        setOptionalProperty(
+                updatedMetadata,
+                "combined.new.lastBuiltAt",
+                combinedBuild.builtCombinedNew() ? Instant.now().toString() : previousMetadata.getProperty("combined.new.lastBuiltAt")
+        );
+
+        updatedMetadata.setProperty("combined.previous.fileName", COMBINED_PREVIOUS_FILE_NAME);
+        setOptionalProperty(
+                updatedMetadata,
+                "combined.previous.md5",
+                firstNonBlank(combinedBuild.combinedPreviousMd5(), previousMetadata.getProperty("combined.previous.md5"))
+        );
+        setOptionalProperty(
+                updatedMetadata,
+                "combined.previous.lastBuiltAt",
+                combinedBuild.builtCombinedPrevious()
+                        ? Instant.now().toString()
+                        : previousMetadata.getProperty("combined.previous.lastBuiltAt")
+        );
     }
 
     private static byte[] downloadDocument(HttpClient httpClient, URI documentUri) throws IOException, InterruptedException {
@@ -430,15 +785,21 @@ public class app {
             Properties metadata,
             String metadataPrefix,
             DocumentRecord document,
-            StorageEngine storageEngine
+            StorageEngine storageEngine,
+            String md5NewChecksum,
+            String md5PreviousChecksum
     ) {
         metadata.setProperty(metadataPrefix + "title", document.title());
         metadata.setProperty(metadataPrefix + "url", document.downloadUri().toString());
         metadata.setProperty(metadataPrefix + "section", document.sectionKey());
         metadata.setProperty(metadataPrefix + "fileName", document.fileName());
+        setOptionalProperty(metadata, metadataPrefix + "previousFileName", document.previousFileName());
         metadata.setProperty(metadataPrefix + "storageEngine", storageEngine.name());
         metadata.setProperty(metadataPrefix + "storageTarget", storageEngine.describeTarget(document));
         metadata.setProperty(metadataPrefix + "lastAmended", safeValue(document.lastAmendedRaw()));
+        setOptionalProperty(metadata, metadataPrefix + "md5.new", md5NewChecksum);
+        setOptionalProperty(metadata, metadataPrefix + "md5.previous", md5PreviousChecksum);
+        setOptionalProperty(metadata, metadataPrefix + "md5", md5NewChecksum);
         metadata.setProperty(metadataPrefix + "lastSyncedAt", Instant.now().toString());
         metadata.remove(metadataPrefix + "lastAttemptFailedAt");
     }
@@ -463,9 +824,13 @@ public class app {
             updatedMetadata.setProperty(metadataPrefix + "url", document.downloadUri().toString());
             updatedMetadata.setProperty(metadataPrefix + "section", document.sectionKey());
             updatedMetadata.setProperty(metadataPrefix + "fileName", document.fileName());
+            setOptionalProperty(updatedMetadata, metadataPrefix + "previousFileName", document.previousFileName());
             updatedMetadata.setProperty(metadataPrefix + "storageEngine", storageEngine.name());
             updatedMetadata.setProperty(metadataPrefix + "storageTarget", storageEngine.describeTarget(document));
             updatedMetadata.setProperty(metadataPrefix + "lastAmended", "");
+            setOptionalProperty(updatedMetadata, metadataPrefix + "md5.new", null);
+            setOptionalProperty(updatedMetadata, metadataPrefix + "md5.previous", null);
+            setOptionalProperty(updatedMetadata, metadataPrefix + "md5", null);
         }
 
         updatedMetadata.setProperty(metadataPrefix + "lastAttemptFailedAt", Instant.now().toString());
@@ -606,7 +971,14 @@ public class app {
         if (id.isBlank()) {
             id = sectionKey + "-document-" + Integer.toHexString(documentUri.toString().hashCode());
         }
-        String fileName = id + "." + extension;
+        String fileName;
+        String previousFileName = null;
+        if ("pdf".equals(extension)) {
+            fileName = id + "_new.pdf";
+            previousFileName = id + "_previous.pdf";
+        } else {
+            fileName = id + "." + extension;
+        }
         return new DocumentRecord(
                 id,
                 normalizeWhitespace(title),
@@ -614,7 +986,8 @@ public class app {
                 sectionKey,
                 normalizeNullable(lastAmendedRaw),
                 lastAmended,
-                fileName
+                fileName,
+                previousFileName
         );
     }
 
@@ -720,6 +1093,36 @@ public class app {
         return value == null ? "" : value;
     }
 
+    private static String firstNonBlank(String... values) {
+        if (values == null) {
+            return null;
+        }
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private static String md5Hex(byte[] bytes) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("MD5");
+            byte[] hash = digest.digest(bytes);
+            return HexFormat.of().formatHex(hash);
+        } catch (NoSuchAlgorithmException ex) {
+            throw new IllegalStateException("MD5 digest is unavailable.", ex);
+        }
+    }
+
+    private static void setOptionalProperty(Properties properties, String key, String value) {
+        if (value == null || value.isBlank()) {
+            properties.remove(key);
+        } else {
+            properties.setProperty(key, value);
+        }
+    }
+
     private static String normalizeStorageEngine(String value) {
         if (value == null || value.isBlank()) {
             return STORAGE_ENGINE_LOCAL;
@@ -778,6 +1181,21 @@ public class app {
         return normalized;
     }
 
+    private static String normalizeWebDavBaseUrl(String baseUrl) {
+        if (baseUrl == null || baseUrl.isBlank()) {
+            throw new IllegalArgumentException("storage.webdav.baseUrl/WEBDAV_BASE_URL cannot be empty.");
+        }
+        String normalized = baseUrl.trim();
+        if (!(normalized.startsWith("http://") || normalized.startsWith("https://"))) {
+            throw new IllegalArgumentException(
+                    "storage.webdav.baseUrl/WEBDAV_BASE_URL must start with http:// or https://");
+        }
+        while (normalized.endsWith("/")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
+    }
+
     private static boolean isNoSuchFileError(SftpException exception) {
         return exception.id == ChannelSftp.SSH_FX_NO_SUCH_FILE;
     }
@@ -788,11 +1206,32 @@ public class app {
 
         String describeRoot();
 
-        String describeTarget(DocumentRecord document);
+        String describeTarget(String fileName);
 
-        boolean exists(DocumentRecord document) throws IOException;
+        boolean exists(String fileName) throws IOException;
 
-        void write(DocumentRecord document, byte[] bytes) throws IOException;
+        byte[] read(String fileName) throws IOException;
+
+        void write(String fileName, byte[] bytes) throws IOException;
+
+        default String describeTarget(DocumentRecord document) {
+            return describeTarget(document.fileName());
+        }
+
+        default boolean exists(DocumentRecord document) throws IOException {
+            return exists(document.fileName());
+        }
+
+        default void preservePrevious(DocumentRecord document) throws IOException {
+            if (document.previousFileName() == null || !exists(document.fileName())) {
+                return;
+            }
+            write(document.previousFileName(), read(document.fileName()));
+        }
+
+        default void write(DocumentRecord document, byte[] bytes) throws IOException {
+            write(document.fileName(), bytes);
+        }
 
         @Override
         default void close() throws IOException {
@@ -819,18 +1258,23 @@ public class app {
         }
 
         @Override
-        public String describeTarget(DocumentRecord document) {
-            return rootDirectory.resolve(document.fileName()).toAbsolutePath().toString();
+        public String describeTarget(String fileName) {
+            return rootDirectory.resolve(fileName).toAbsolutePath().toString();
         }
 
         @Override
-        public boolean exists(DocumentRecord document) {
-            return Files.exists(rootDirectory.resolve(document.fileName()));
+        public boolean exists(String fileName) {
+            return Files.exists(rootDirectory.resolve(fileName));
         }
 
         @Override
-        public void write(DocumentRecord document, byte[] bytes) throws IOException {
-            Path destinationPath = rootDirectory.resolve(document.fileName());
+        public byte[] read(String fileName) throws IOException {
+            return Files.readAllBytes(rootDirectory.resolve(fileName));
+        }
+
+        @Override
+        public void write(String fileName, byte[] bytes) throws IOException {
+            Path destinationPath = rootDirectory.resolve(fileName);
             Path tempFile = Files.createTempFile(rootDirectory, "rules-standards-", ".tmp");
             try {
                 Files.write(tempFile, bytes, StandardOpenOption.TRUNCATE_EXISTING);
@@ -899,14 +1343,14 @@ public class app {
         }
 
         @Override
-        public String describeTarget(DocumentRecord document) {
-            return "sftp://" + settings.sftpHost() + ":" + settings.sftpPort() + remotePath(document.fileName());
+        public String describeTarget(String fileName) {
+            return "sftp://" + settings.sftpHost() + ":" + settings.sftpPort() + remotePath(fileName);
         }
 
         @Override
-        public boolean exists(DocumentRecord document) throws IOException {
+        public boolean exists(String fileName) throws IOException {
             try {
-                channel.lstat(remotePath(document.fileName()));
+                channel.lstat(remotePath(fileName));
                 return true;
             } catch (SftpException ex) {
                 if (isNoSuchFileError(ex)) {
@@ -917,8 +1361,17 @@ public class app {
         }
 
         @Override
-        public void write(DocumentRecord document, byte[] bytes) throws IOException {
-            String targetPath = remotePath(document.fileName());
+        public byte[] read(String fileName) throws IOException {
+            try {
+                return readRemoteFile(remotePath(fileName));
+            } catch (SftpException ex) {
+                throw new IOException("Unable to read SFTP file '" + fileName + "'.", ex);
+            }
+        }
+
+        @Override
+        public void write(String fileName, byte[] bytes) throws IOException {
+            String targetPath = remotePath(fileName);
             String tempPath = targetPath + ".tmp-" + Instant.now().toEpochMilli();
             try (ByteArrayInputStream input = new ByteArrayInputStream(bytes)) {
                 channel.put(input, tempPath, ChannelSftp.OVERWRITE);
@@ -951,6 +1404,12 @@ public class app {
                 return "/" + fileName;
             }
             return remoteRoot + "/" + fileName;
+        }
+
+        private byte[] readRemoteFile(String remoteFilePath) throws SftpException {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            channel.get(remoteFilePath, output);
+            return output.toByteArray();
         }
 
         private void cleanupTempFile(String tempPath) {
@@ -986,7 +1445,213 @@ public class app {
         }
     }
 
-    private record SyncStats(int downloaded, int updated, int skipped, int failed) {
+    private static final class WebDavStorageEngine implements StorageEngine {
+
+        private final StorageSettings settings;
+        private final HttpClient httpClient;
+        private final String baseUrl;
+        private final String remoteRoot;
+        private final String authorizationHeader;
+        private final Duration timeout;
+
+        private WebDavStorageEngine(StorageSettings settings) throws IOException {
+            this.settings = settings;
+            this.baseUrl = normalizeWebDavBaseUrl(settings.webDavBaseUrl());
+            this.remoteRoot = normalizeRemoteDirectory(settings.webDavRemoteDir());
+            this.timeout = Duration.ofSeconds(settings.webDavTimeoutSeconds());
+            this.authorizationHeader = basicAuthHeader(settings.webDavUsername(), settings.webDavPassword());
+            this.httpClient = HttpClient.newBuilder()
+                    .followRedirects(HttpClient.Redirect.NORMAL)
+                    .connectTimeout(this.timeout)
+                    .build();
+
+            ensureRemoteDirectoryExists();
+        }
+
+        @Override
+        public String name() {
+            return STORAGE_ENGINE_WEBDAV;
+        }
+
+        @Override
+        public String describeRoot() {
+            return settings.webDavEndpoint();
+        }
+
+        @Override
+        public String describeTarget(String fileName) {
+            return urlForPath(remotePath(fileName));
+        }
+
+        @Override
+        public boolean exists(String fileName) throws IOException {
+            String targetUrl = urlForPath(remotePath(fileName));
+            int statusCode = sendWithoutBody("HEAD", targetUrl, false);
+            if (isSuccessStatus(statusCode)) {
+                return true;
+            }
+            if (statusCode == 404) {
+                return false;
+            }
+            if (statusCode == 405) {
+                int fallback = sendWithoutBody("PROPFIND", targetUrl, true);
+                if (isSuccessStatus(fallback) || fallback == 207) {
+                    return true;
+                }
+                if (fallback == 404) {
+                    return false;
+                }
+                throw new IOException("WebDAV PROPFIND failed with HTTP status " + fallback + " for " + targetUrl);
+            }
+            throw new IOException("WebDAV HEAD failed with HTTP status " + statusCode + " for " + targetUrl);
+        }
+
+        @Override
+        public byte[] read(String fileName) throws IOException {
+            String url = urlForPath(remotePath(fileName));
+            HttpResponse<byte[]> response = sendRead("GET", url);
+            int statusCode = response.statusCode();
+            if (!isSuccessStatus(statusCode)) {
+                throw new IOException("WebDAV GET failed with HTTP status " + statusCode + " for " + url);
+            }
+            return response.body();
+        }
+
+        @Override
+        public void write(String fileName, byte[] bytes) throws IOException {
+            String targetUrl = urlForPath(remotePath(fileName));
+            int statusCode = sendWithBody("PUT", targetUrl, bytes);
+            if (!isSuccessStatus(statusCode)) {
+                throw new IOException("WebDAV PUT failed with HTTP status " + statusCode + " for " + targetUrl);
+            }
+        }
+
+        private void ensureRemoteDirectoryExists() throws IOException {
+            if ("/".equals(remoteRoot)) {
+                return;
+            }
+
+            String[] parts = remoteRoot.substring(1).split("/");
+            StringBuilder currentPath = new StringBuilder();
+            for (String part : parts) {
+                if (part.isBlank()) {
+                    continue;
+                }
+                currentPath.append('/').append(part);
+                int statusCode = sendWithoutBody("MKCOL", urlForPath(currentPath + "/"), false);
+                if (statusCode == 201 || statusCode == 405 || statusCode == 301 || statusCode == 302
+                        || statusCode == 307 || statusCode == 308 || isSuccessStatus(statusCode)) {
+                    continue;
+                }
+                throw new IOException(
+                        "WebDAV MKCOL failed with HTTP status " + statusCode + " while creating " + currentPath);
+            }
+        }
+
+        private int sendWithoutBody(String method, String url, boolean propfindDepthZero) throws IOException {
+            HttpRequest.Builder builder = requestBuilder(url);
+            if (propfindDepthZero) {
+                builder.header("Depth", "0");
+            }
+            HttpRequest request = builder
+                    .method(method, HttpRequest.BodyPublishers.noBody())
+                    .build();
+            try {
+                HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+                return response.statusCode();
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted during WebDAV request.", ex);
+            }
+        }
+
+        private HttpResponse<byte[]> sendRead(String method, String url) throws IOException {
+            HttpRequest request = requestBuilder(url)
+                    .method(method, HttpRequest.BodyPublishers.noBody())
+                    .build();
+            try {
+                return httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted during WebDAV read request.", ex);
+            }
+        }
+
+        private int sendWithBody(String method, String url, byte[] body) throws IOException {
+            HttpRequest request = requestBuilder(url)
+                    .header("Content-Type", "application/octet-stream")
+                    .method(method, HttpRequest.BodyPublishers.ofByteArray(body))
+                    .build();
+            try {
+                HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+                return response.statusCode();
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted during WebDAV upload.", ex);
+            }
+        }
+
+        private HttpRequest.Builder requestBuilder(String url) throws IOException {
+            URI uri;
+            try {
+                uri = URI.create(url);
+            } catch (IllegalArgumentException ex) {
+                throw new IOException("Invalid WebDAV URL: " + url, ex);
+            }
+
+            return HttpRequest.newBuilder(uri)
+                    .timeout(timeout)
+                    .header("Authorization", authorizationHeader)
+                    .header("Accept", "*/*");
+        }
+
+        private String remotePath(String fileName) {
+            if ("/".equals(remoteRoot)) {
+                return "/" + fileName;
+            }
+            return remoteRoot + "/" + fileName;
+        }
+
+        private String urlForPath(String path) {
+            return baseUrl + path;
+        }
+
+        private static String basicAuthHeader(String username, String password) {
+            String credentials = username + ":" + password;
+            String encoded = Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
+            return "Basic " + encoded;
+        }
+
+        private static boolean isSuccessStatus(int statusCode) {
+            return statusCode >= 200 && statusCode < 300;
+        }
+    }
+
+    private record CombinedBuildResult(
+            boolean builtCombinedNew,
+            String combinedNewMd5,
+            boolean builtCombinedPrevious,
+            String combinedPreviousMd5
+    ) {
+
+        private static CombinedBuildResult none() {
+            return new CombinedBuildResult(false, null, false, null);
+        }
+    }
+
+    private record CombinedPdfSource(String title, String fileName, byte[] bytes) {
+    }
+
+    private record TocEntry(String title, int targetPageIndex) {
+    }
+
+    private record SyncStats(
+            int downloaded,
+            int updated,
+            int skipped,
+            int failed,
+            Set<String> updatedDocumentIds
+    ) {
     }
 
     private record StorageSettings(
@@ -996,15 +1661,84 @@ public class app {
             String sftpUsername,
             String sftpPassword,
             String sftpRemoteDir,
-            int sftpTimeoutSeconds
+            int sftpTimeoutSeconds,
+            String webDavBaseUrl,
+            String webDavUsername,
+            String webDavPassword,
+            String webDavRemoteDir,
+            int webDavTimeoutSeconds
     ) {
 
         private static StorageSettings local() {
-            return new StorageSettings(STORAGE_ENGINE_LOCAL, null, 22, null, null, "/", 30);
+            return new StorageSettings(
+                    STORAGE_ENGINE_LOCAL,
+                    null,
+                    22,
+                    null,
+                    null,
+                    "/",
+                    30,
+                    null,
+                    null,
+                    null,
+                    "/",
+                    30
+            );
+        }
+
+        private static StorageSettings sftp(
+                String host,
+                int port,
+                String username,
+                String password,
+                String remoteDir,
+                int timeoutSeconds
+        ) {
+            return new StorageSettings(
+                    STORAGE_ENGINE_SFTP,
+                    host,
+                    port,
+                    username,
+                    password,
+                    remoteDir,
+                    timeoutSeconds,
+                    null,
+                    null,
+                    null,
+                    "/",
+                    30
+            );
+        }
+
+        private static StorageSettings webDav(
+                String baseUrl,
+                String username,
+                String password,
+                String remoteDir,
+                int timeoutSeconds
+        ) {
+            return new StorageSettings(
+                    STORAGE_ENGINE_WEBDAV,
+                    null,
+                    22,
+                    null,
+                    null,
+                    "/",
+                    30,
+                    baseUrl,
+                    username,
+                    password,
+                    remoteDir,
+                    timeoutSeconds
+            );
         }
 
         private String sftpEndpoint() {
             return "sftp://" + sftpHost + ":" + sftpPort + sftpRemoteDir;
+        }
+
+        private String webDavEndpoint() {
+            return webDavBaseUrl + webDavRemoteDir;
         }
     }
 
@@ -1015,8 +1749,13 @@ public class app {
             String sectionKey,
             String lastAmendedRaw,
             LocalDate lastAmended,
-            String fileName
+            String fileName,
+            String previousFileName
     ) {
+
+        private boolean isPdf() {
+            return fileName != null && fileName.toLowerCase(Locale.US).endsWith(".pdf");
+        }
     }
 
     private enum TokenType {
