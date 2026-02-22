@@ -83,6 +83,9 @@ public class app {
     private static final String STORAGE_ENGINE_LOCAL = "local";
     private static final String STORAGE_ENGINE_SFTP = "sftp";
     private static final String STORAGE_ENGINE_WEBDAV = "webdav";
+    private static final String RETAIN_PREVIOUS_ENABLED_PROPERTY = "retain.previous.enabled";
+    private static final String RETAIN_PREVIOUS_ENABLED_ENV = "RETAIN_PREVIOUS_ENABLED";
+    private static final boolean DEFAULT_RETAIN_PREVIOUS_ENABLED = false;
     private static final String COMBINED_PDF_ENABLED_PROPERTY = "combined.pdf.enabled";
     private static final String COMBINED_PDF_ENABLED_ENV = "COMBINED_PDF_ENABLED";
     private static final boolean DEFAULT_COMBINED_PDF_ENABLED = false;
@@ -90,7 +93,8 @@ public class app {
     private static final String TEXT_EXTRACTION_ENABLED_ENV = "TEXT_EXTRACTION_ENABLED";
     private static final boolean DEFAULT_TEXT_EXTRACTION_ENABLED = false;
     private static final String TEXT_OUTPUT_DIRECTORY = "txt";
-    private static final String COMBINED_NEW_FILE_NAME = "combined_new.pdf";
+    private static final String COMBINED_NEW_FILE_NAME = "combined.pdf";
+    private static final String LEGACY_COMBINED_NEW_FILE_NAME = "combined_new.pdf";
     private static final String COMBINED_PREVIOUS_FILE_NAME = "combined_previous.pdf";
     private static final Set<String> DOCUMENT_EXTENSIONS = Set.of("pdf", "doc", "docx");
     private static final String HTTP_USER_AGENT = "texas-rules-and-standards-sync/1.0 (+https://www.txcourts.gov/)";
@@ -116,9 +120,11 @@ public class app {
             LOGGER.info("Data directory: " + DATA_DIRECTORY.toAbsolutePath());
 
             StorageSettings storageSettings = resolveStorageSettings();
+            boolean retainPreviousEnabled = resolveRetainPreviousEnabled();
             boolean combinedPdfEnabled = resolveCombinedPdfEnabled();
             boolean textExtractionEnabled = resolveTextExtractionEnabled();
             LOGGER.info("Configured storage engine: " + storageSettings.engine());
+            LOGGER.info("Configured previous-version retention: " + (retainPreviousEnabled ? "enabled" : "disabled"));
             LOGGER.info("Configured combined PDF generation: " + (combinedPdfEnabled ? "enabled" : "disabled"));
             LOGGER.info("Configured text extraction: " + (textExtractionEnabled ? "enabled" : "disabled"));
             if (STORAGE_ENGINE_SFTP.equals(storageSettings.engine())) {
@@ -151,25 +157,40 @@ public class app {
                 LOGGER.info("Storage root: " + storageEngine.describeRoot());
 
                 Properties updatedMetadata = new Properties();
-                SyncStats stats = syncDocuments(httpClient, documents, previousMetadata, updatedMetadata, storageEngine);
+                SyncStats stats = syncDocuments(
+                        httpClient,
+                        documents,
+                        previousMetadata,
+                        updatedMetadata,
+                        storageEngine,
+                        retainPreviousEnabled
+                );
                 if (combinedPdfEnabled) {
                     CombinedBuildResult combinedBuild = buildCombinedPdfs(
                             documents,
                             storageEngine,
                             stats.downloaded() > 0,
-                            stats.updatedDocumentIds()
+                            stats.updatedDocumentIds(),
+                            retainPreviousEnabled
                     );
-                    applyCombinedMetadata(updatedMetadata, combinedBuild, previousMetadata);
+                    applyCombinedMetadata(updatedMetadata, combinedBuild, previousMetadata, retainPreviousEnabled);
                 } else {
                     LOGGER.info("Skipping combined PDF generation; combined PDF output is disabled.");
-                    applyCombinedMetadata(updatedMetadata, CombinedBuildResult.none(), previousMetadata);
+                    applyCombinedMetadata(updatedMetadata, CombinedBuildResult.none(), previousMetadata, retainPreviousEnabled);
                 }
                 if (textExtractionEnabled) {
-                    extractPdfTextArtifacts(documents, storageEngine, updatedMetadata, previousMetadata);
+                    extractPdfTextArtifacts(
+                            documents,
+                            storageEngine,
+                            updatedMetadata,
+                            previousMetadata,
+                            retainPreviousEnabled
+                    );
                 } else {
                     LOGGER.info("Skipping .txt extraction artifacts; text extraction is disabled.");
-                    preserveTextArtifactMetadata(updatedMetadata, previousMetadata);
+                    preserveTextArtifactMetadata(updatedMetadata, previousMetadata, retainPreviousEnabled);
                 }
+                updatedMetadata.setProperty(RETAIN_PREVIOUS_ENABLED_PROPERTY, Boolean.toString(retainPreviousEnabled));
                 updatedMetadata.setProperty(COMBINED_PDF_ENABLED_PROPERTY, Boolean.toString(combinedPdfEnabled));
                 updatedMetadata.setProperty(TEXT_EXTRACTION_ENABLED_PROPERTY, Boolean.toString(textExtractionEnabled));
                 updatedMetadata.setProperty("storage.engine", storageEngine.name());
@@ -219,6 +240,15 @@ public class app {
         }
         throw new IllegalArgumentException(
                 "Unsupported storage engine '" + configuredEngine + "'. Supported values: local, sftp, webdav.");
+    }
+
+    private static boolean resolveRetainPreviousEnabled() {
+        String raw = readConfig(
+                RETAIN_PREVIOUS_ENABLED_PROPERTY,
+                RETAIN_PREVIOUS_ENABLED_ENV,
+                Boolean.toString(DEFAULT_RETAIN_PREVIOUS_ENABLED)
+        );
+        return parseBooleanConfig(raw, RETAIN_PREVIOUS_ENABLED_PROPERTY + "/" + RETAIN_PREVIOUS_ENABLED_ENV);
     }
 
     private static boolean resolveCombinedPdfEnabled() {
@@ -434,7 +464,8 @@ public class app {
             List<DocumentRecord> documents,
             Properties previousMetadata,
             Properties updatedMetadata,
-            StorageEngine storageEngine
+            StorageEngine storageEngine,
+            boolean retainPreviousEnabled
     ) throws IOException, InterruptedException {
         int downloaded = 0;
         int updated = 0;
@@ -453,16 +484,25 @@ public class app {
             String metadataPrefix = "doc." + document.id() + ".";
             String previousLastAmended = previousMetadata.getProperty(metadataPrefix + "lastAmended");
             String previousUrl = previousMetadata.getProperty(metadataPrefix + "url");
+            String previousStoredFileName = previousMetadata.getProperty(metadataPrefix + "fileName");
             String previousMd5New = firstNonBlank(
                     previousMetadata.getProperty(metadataPrefix + "md5.new"),
                     previousMetadata.getProperty(metadataPrefix + "md5"));
-            String previousMd5Previous = previousMetadata.getProperty(metadataPrefix + "md5.previous");
+            String previousMd5Previous = retainPreviousEnabled ? previousMetadata.getProperty(metadataPrefix + "md5.previous") : null;
 
             boolean storedCopyExists = storageEngine.exists(document);
+            if (!storedCopyExists) {
+                byte[] migratedBytes = migrateLegacyCurrentFileIfPresent(storageEngine, document, previousStoredFileName);
+                if (migratedBytes != null) {
+                    storedCopyExists = true;
+                    previousMd5New = firstNonBlank(previousMd5New, md5Hex(migratedBytes));
+                }
+            }
             if ((previousMd5New == null || previousMd5New.isBlank()) && storedCopyExists) {
                 previousMd5New = md5Hex(storageEngine.read(document.fileName()));
             }
-            if ((previousMd5Previous == null || previousMd5Previous.isBlank())
+            if (retainPreviousEnabled
+                    && (previousMd5Previous == null || previousMd5Previous.isBlank())
                     && document.previousFileName() != null
                     && storageEngine.exists(document.previousFileName())) {
                 previousMd5Previous = md5Hex(storageEngine.read(document.previousFileName()));
@@ -502,7 +542,7 @@ public class app {
                     boolean isUpdate = storedCopyExists;
                     byte[] bytes = downloadDocument(httpClient, document.downloadUri());
                     String md5PreviousVersion = previousMd5Previous;
-                    if (isUpdate) {
+                    if (isUpdate && retainPreviousEnabled) {
                         storageEngine.preservePrevious(document);
                         if (document.previousFileName() != null && storageEngine.exists(document.previousFileName())) {
                             md5PreviousVersion = md5Hex(storageEngine.read(document.previousFileName()));
@@ -522,12 +562,20 @@ public class app {
                             document,
                             storageEngine,
                             md5NewVersion,
-                            md5PreviousVersion
+                            md5PreviousVersion,
+                            retainPreviousEnabled
                     );
                 } catch (IOException | InterruptedException ex) {
                     failed++;
                     LOGGER.log(Level.SEVERE, "  Result: download+store failed for '" + document.title() + "'", ex);
-                    preservePreviousMetadata(updatedMetadata, previousMetadata, metadataPrefix, document, storageEngine);
+                    preservePreviousMetadata(
+                            updatedMetadata,
+                            previousMetadata,
+                            metadataPrefix,
+                            document,
+                            storageEngine,
+                            retainPreviousEnabled
+                    );
                     if (ex instanceof InterruptedException) {
                         Thread.currentThread().interrupt();
                         throw ex;
@@ -542,7 +590,8 @@ public class app {
                         document,
                         storageEngine,
                         previousMd5New,
-                        previousMd5Previous
+                        previousMd5Previous,
+                        retainPreviousEnabled
                 );
             }
         }
@@ -559,7 +608,8 @@ public class app {
             List<DocumentRecord> documents,
             StorageEngine storageEngine,
             boolean hadDownloads,
-            Set<String> updatedDocumentIds
+            Set<String> updatedDocumentIds,
+            boolean retainPreviousEnabled
     ) throws IOException {
         boolean hadUpdates = updatedDocumentIds != null && !updatedDocumentIds.isEmpty();
         List<DocumentRecord> pdfDocuments = new ArrayList<>();
@@ -580,6 +630,11 @@ public class app {
         boolean builtCombinedPrevious = false;
 
         boolean combinedNewExists = storageEngine.exists(COMBINED_NEW_FILE_NAME);
+        if (!combinedNewExists && storageEngine.exists(LEGACY_COMBINED_NEW_FILE_NAME)) {
+            LOGGER.info("Migrating combined file name from '" + LEGACY_COMBINED_NEW_FILE_NAME + "' to '" + COMBINED_NEW_FILE_NAME + "'.");
+            storageEngine.write(COMBINED_NEW_FILE_NAME, storageEngine.read(LEGACY_COMBINED_NEW_FILE_NAME));
+            combinedNewExists = true;
+        }
         boolean shouldBuildCombinedNew = hadDownloads || hadUpdates || !combinedNewExists;
         if (shouldBuildCombinedNew) {
             List<CombinedPdfSource> newSources = collectCombinedSources(pdfDocuments, storageEngine, false, updatedDocumentIds);
@@ -597,7 +652,7 @@ public class app {
             combinedNewMd5 = computeStoredMd5IfPresent(storageEngine, COMBINED_NEW_FILE_NAME);
         }
 
-        if (hadUpdates) {
+        if (hadUpdates && retainPreviousEnabled) {
             List<CombinedPdfSource> previousSources = collectCombinedSources(
                     pdfDocuments,
                     storageEngine,
@@ -617,14 +672,18 @@ public class app {
                 LOGGER.info("Built " + COMBINED_PREVIOUS_FILE_NAME + " from " + previousSources.size() + " PDF(s).");
             }
         } else {
-            LOGGER.info("Skipping " + COMBINED_PREVIOUS_FILE_NAME + "; no rule-set updates detected.");
-            combinedPreviousMd5 = computeStoredMd5IfPresent(storageEngine, COMBINED_PREVIOUS_FILE_NAME);
+            if (!retainPreviousEnabled) {
+                LOGGER.info("Skipping " + COMBINED_PREVIOUS_FILE_NAME + "; previous-version retention is disabled.");
+            } else {
+                LOGGER.info("Skipping " + COMBINED_PREVIOUS_FILE_NAME + "; no rule-set updates detected.");
+                combinedPreviousMd5 = computeStoredMd5IfPresent(storageEngine, COMBINED_PREVIOUS_FILE_NAME);
+            }
         }
 
         if (combinedNewMd5 == null) {
             combinedNewMd5 = computeStoredMd5IfPresent(storageEngine, COMBINED_NEW_FILE_NAME);
         }
-        if (combinedPreviousMd5 == null) {
+        if (retainPreviousEnabled && combinedPreviousMd5 == null) {
             combinedPreviousMd5 = computeStoredMd5IfPresent(storageEngine, COMBINED_PREVIOUS_FILE_NAME);
         }
 
@@ -858,7 +917,8 @@ public class app {
     private static void applyCombinedMetadata(
             Properties updatedMetadata,
             CombinedBuildResult combinedBuild,
-            Properties previousMetadata
+            Properties previousMetadata,
+            boolean retainPreviousEnabled
     ) {
         updatedMetadata.setProperty("combined.new.fileName", COMBINED_NEW_FILE_NAME);
         setOptionalProperty(
@@ -872,26 +932,33 @@ public class app {
                 combinedBuild.builtCombinedNew() ? Instant.now().toString() : previousMetadata.getProperty("combined.new.lastBuiltAt")
         );
 
-        updatedMetadata.setProperty("combined.previous.fileName", COMBINED_PREVIOUS_FILE_NAME);
-        setOptionalProperty(
-                updatedMetadata,
-                "combined.previous.md5",
-                firstNonBlank(combinedBuild.combinedPreviousMd5(), previousMetadata.getProperty("combined.previous.md5"))
-        );
-        setOptionalProperty(
-                updatedMetadata,
-                "combined.previous.lastBuiltAt",
-                combinedBuild.builtCombinedPrevious()
-                        ? Instant.now().toString()
-                        : previousMetadata.getProperty("combined.previous.lastBuiltAt")
-        );
+        if (retainPreviousEnabled) {
+            updatedMetadata.setProperty("combined.previous.fileName", COMBINED_PREVIOUS_FILE_NAME);
+            setOptionalProperty(
+                    updatedMetadata,
+                    "combined.previous.md5",
+                    firstNonBlank(combinedBuild.combinedPreviousMd5(), previousMetadata.getProperty("combined.previous.md5"))
+            );
+            setOptionalProperty(
+                    updatedMetadata,
+                    "combined.previous.lastBuiltAt",
+                    combinedBuild.builtCombinedPrevious()
+                            ? Instant.now().toString()
+                            : previousMetadata.getProperty("combined.previous.lastBuiltAt")
+            );
+        } else {
+            updatedMetadata.remove("combined.previous.fileName");
+            updatedMetadata.remove("combined.previous.md5");
+            updatedMetadata.remove("combined.previous.lastBuiltAt");
+        }
     }
 
     private static void extractPdfTextArtifacts(
             List<DocumentRecord> documents,
             StorageEngine storageEngine,
             Properties updatedMetadata,
-            Properties previousMetadata
+            Properties previousMetadata,
+            boolean retainPreviousEnabled
     ) {
         LOGGER.info("Ensuring .txt extraction artifacts for PDF files.");
 
@@ -911,7 +978,7 @@ public class app {
                     newPdfMd5
             );
 
-            if (document.previousFileName() != null) {
+            if (retainPreviousEnabled && document.previousFileName() != null) {
                 String previousPdfMd5 = updatedMetadata.getProperty(docPrefix + "md5.previous");
                 ensureTextArtifact(
                         storageEngine,
@@ -934,32 +1001,52 @@ public class app {
                 COMBINED_NEW_FILE_NAME,
                 updatedMetadata.getProperty("combined.new.md5")
         );
-        ensureTextArtifact(
-                storageEngine,
-                updatedMetadata,
-                previousMetadata,
-                "combined.previous.txt",
-                COMBINED_PREVIOUS_FILE_NAME,
-                updatedMetadata.getProperty("combined.previous.md5")
-        );
+        if (retainPreviousEnabled) {
+            ensureTextArtifact(
+                    storageEngine,
+                    updatedMetadata,
+                    previousMetadata,
+                    "combined.previous.txt",
+                    COMBINED_PREVIOUS_FILE_NAME,
+                    updatedMetadata.getProperty("combined.previous.md5")
+            );
+        } else {
+            clearTextArtifactMetadata(updatedMetadata, "combined.previous.txt");
+        }
     }
 
-    private static void preserveTextArtifactMetadata(Properties updatedMetadata, Properties previousMetadata) {
+    private static void preserveTextArtifactMetadata(
+            Properties updatedMetadata,
+            Properties previousMetadata,
+            boolean retainPreviousEnabled
+    ) {
         for (String key : previousMetadata.stringPropertyNames()) {
-            if (isTextArtifactMetadataKey(key)) {
+            if (isTextArtifactMetadataKey(key, retainPreviousEnabled)) {
                 updatedMetadata.setProperty(key, previousMetadata.getProperty(key, ""));
             }
         }
     }
 
-    private static boolean isTextArtifactMetadataKey(String key) {
+    private static boolean isTextArtifactMetadataKey(String key, boolean retainPreviousEnabled) {
         if (key == null || key.isBlank()) {
             return false;
         }
-        if (key.startsWith("combined.new.txt.") || key.startsWith("combined.previous.txt.")) {
+        if (key.startsWith("combined.new.txt.")) {
             return true;
         }
-        return key.startsWith("doc.") && (key.contains(".txt.new.") || key.contains(".txt.previous."));
+        if (key.startsWith("combined.previous.txt.")) {
+            return retainPreviousEnabled;
+        }
+        if (!key.startsWith("doc.")) {
+            return false;
+        }
+        if (key.contains(".txt.new.")) {
+            return true;
+        }
+        if (key.contains(".txt.previous.")) {
+            return retainPreviousEnabled;
+        }
+        return false;
     }
 
     private static void ensureTextArtifact(
@@ -1117,18 +1204,19 @@ public class app {
             DocumentRecord document,
             StorageEngine storageEngine,
             String md5NewChecksum,
-            String md5PreviousChecksum
+            String md5PreviousChecksum,
+            boolean retainPreviousEnabled
     ) {
         metadata.setProperty(metadataPrefix + "title", document.title());
         metadata.setProperty(metadataPrefix + "url", document.downloadUri().toString());
         metadata.setProperty(metadataPrefix + "section", document.sectionKey());
         metadata.setProperty(metadataPrefix + "fileName", document.fileName());
-        setOptionalProperty(metadata, metadataPrefix + "previousFileName", document.previousFileName());
+        setOptionalProperty(metadata, metadataPrefix + "previousFileName", retainPreviousEnabled ? document.previousFileName() : null);
         metadata.setProperty(metadataPrefix + "storageEngine", storageEngine.name());
         metadata.setProperty(metadataPrefix + "storageTarget", storageEngine.describeTarget(document));
         metadata.setProperty(metadataPrefix + "lastAmended", safeValue(document.lastAmendedRaw()));
         setOptionalProperty(metadata, metadataPrefix + "md5.new", md5NewChecksum);
-        setOptionalProperty(metadata, metadataPrefix + "md5.previous", md5PreviousChecksum);
+        setOptionalProperty(metadata, metadataPrefix + "md5.previous", retainPreviousEnabled ? md5PreviousChecksum : null);
         setOptionalProperty(metadata, metadataPrefix + "md5", md5NewChecksum);
         metadata.setProperty(metadataPrefix + "lastSyncedAt", Instant.now().toString());
         metadata.remove(metadataPrefix + "lastAttemptFailedAt");
@@ -1139,7 +1227,8 @@ public class app {
             Properties previousMetadata,
             String metadataPrefix,
             DocumentRecord document,
-            StorageEngine storageEngine
+            StorageEngine storageEngine,
+            boolean retainPreviousEnabled
     ) {
         boolean copied = false;
         for (String key : previousMetadata.stringPropertyNames()) {
@@ -1154,13 +1243,22 @@ public class app {
             updatedMetadata.setProperty(metadataPrefix + "url", document.downloadUri().toString());
             updatedMetadata.setProperty(metadataPrefix + "section", document.sectionKey());
             updatedMetadata.setProperty(metadataPrefix + "fileName", document.fileName());
-            setOptionalProperty(updatedMetadata, metadataPrefix + "previousFileName", document.previousFileName());
+            setOptionalProperty(
+                    updatedMetadata,
+                    metadataPrefix + "previousFileName",
+                    retainPreviousEnabled ? document.previousFileName() : null
+            );
             updatedMetadata.setProperty(metadataPrefix + "storageEngine", storageEngine.name());
             updatedMetadata.setProperty(metadataPrefix + "storageTarget", storageEngine.describeTarget(document));
             updatedMetadata.setProperty(metadataPrefix + "lastAmended", "");
             setOptionalProperty(updatedMetadata, metadataPrefix + "md5.new", null);
             setOptionalProperty(updatedMetadata, metadataPrefix + "md5.previous", null);
             setOptionalProperty(updatedMetadata, metadataPrefix + "md5", null);
+        }
+
+        if (!retainPreviousEnabled) {
+            updatedMetadata.remove(metadataPrefix + "previousFileName");
+            updatedMetadata.remove(metadataPrefix + "md5.previous");
         }
 
         updatedMetadata.setProperty(metadataPrefix + "lastAttemptFailedAt", Instant.now().toString());
@@ -1304,7 +1402,7 @@ public class app {
         String fileName;
         String previousFileName = null;
         if ("pdf".equals(extension)) {
-            fileName = id + "_new.pdf";
+            fileName = id + ".pdf";
             previousFileName = id + "_previous.pdf";
         } else {
             fileName = id + "." + extension;
@@ -1319,6 +1417,50 @@ public class app {
                 fileName,
                 previousFileName
         );
+    }
+
+    private static byte[] migrateLegacyCurrentFileIfPresent(
+            StorageEngine storageEngine,
+            DocumentRecord document,
+            String previousMetadataFileName
+    ) throws IOException {
+        List<String> candidateLegacyNames = new ArrayList<>();
+        if (previousMetadataFileName != null
+                && !previousMetadataFileName.isBlank()
+                && !previousMetadataFileName.equals(document.fileName())) {
+            candidateLegacyNames.add(previousMetadataFileName);
+        }
+
+        String derivedLegacyFileName = deriveLegacyNewFileName(document);
+        if (derivedLegacyFileName != null && !candidateLegacyNames.contains(derivedLegacyFileName)) {
+            candidateLegacyNames.add(derivedLegacyFileName);
+        }
+
+        for (String legacyName : candidateLegacyNames) {
+            if (!storageEngine.exists(legacyName)) {
+                continue;
+            }
+            LOGGER.info("  Migrating current file name from '" + legacyName + "' to '" + document.fileName() + "'.");
+            byte[] bytes = storageEngine.read(legacyName);
+            storageEngine.write(document.fileName(), bytes);
+            return bytes;
+        }
+
+        return null;
+    }
+
+    private static String deriveLegacyNewFileName(DocumentRecord document) {
+        if (document == null || !document.isPdf()) {
+            return null;
+        }
+        String currentFileName = document.fileName();
+        if (currentFileName == null || !currentFileName.toLowerCase(Locale.US).endsWith(".pdf")) {
+            return null;
+        }
+        if (currentFileName.toLowerCase(Locale.US).endsWith("_new.pdf")) {
+            return null;
+        }
+        return currentFileName.substring(0, currentFileName.length() - 4) + "_new.pdf";
     }
 
     private static String determineExtension(URI documentUri) {
