@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.io.StringReader;
 import java.io.StringWriter;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -122,12 +123,19 @@ public class app {
     private static final String TEXT_EXTRACTION_ENABLED_PROPERTY = "text.extraction.enabled";
     private static final String TEXT_EXTRACTION_ENABLED_ENV = "TEXT_EXTRACTION_ENABLED";
     private static final boolean DEFAULT_TEXT_EXTRACTION_ENABLED = false;
+    private static final String DOWNLOAD_WEBHOOK_URL_PROPERTY = "download.webhook.url";
+    private static final String DOWNLOAD_WEBHOOK_URL_ENV = "DOWNLOAD_WEBHOOK_URL";
+    private static final String DOWNLOAD_WEBHOOK_TIMEOUT_SECONDS_PROPERTY = "download.webhook.timeoutSeconds";
+    private static final String DOWNLOAD_WEBHOOK_TIMEOUT_SECONDS_ENV = "DOWNLOAD_WEBHOOK_TIMEOUT_SECONDS";
+    private static final int DEFAULT_DOWNLOAD_WEBHOOK_TIMEOUT_SECONDS = 15;
     private static final String TEXT_OUTPUT_DIRECTORY = "txt";
     private static final String COMBINED_NEW_FILE_NAME = "combined.pdf";
     private static final String LEGACY_COMBINED_NEW_FILE_NAME = "combined_new.pdf";
     private static final String COMBINED_PREVIOUS_FILE_NAME = "combined_previous.pdf";
     private static final Set<String> DOCUMENT_EXTENSIONS = Set.of("pdf", "doc", "docx");
-    private static final String HTTP_USER_AGENT = "texas-rules-and-standards-sync/1.0 (+https://www.txcourts.gov/)";
+    private static final String SOURCE_PAGE_USER_AGENT = "texas-rules-and-standards-sync/1.0 (+https://www.txcourts.gov/)";
+    private static final String DOWNLOAD_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
     private static final Pattern DATE_PATTERN = Pattern.compile(
             "(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{1,2},\\s+\\d{4}");
     private static final Pattern LAST_AMENDED_PATTERN = Pattern.compile(
@@ -157,10 +165,12 @@ public class app {
             boolean retainPreviousEnabled = resolveRetainPreviousEnabled();
             boolean combinedPdfEnabled = resolveCombinedPdfEnabled();
             boolean textExtractionEnabled = resolveTextExtractionEnabled();
+            WebhookSettings webhookSettings = resolveDownloadWebhookSettings();
             LOGGER.info("Configured storage engine: " + storageSettings.engine());
             LOGGER.info("Configured previous-version retention: " + (retainPreviousEnabled ? "enabled" : "disabled"));
             LOGGER.info("Configured combined PDF generation: " + (combinedPdfEnabled ? "enabled" : "disabled"));
             LOGGER.info("Configured text extraction: " + (textExtractionEnabled ? "enabled" : "disabled"));
+            LOGGER.info("Configured download webhook: " + (webhookSettings == null ? "disabled" : webhookSettings.targetUri()));
             if (STORAGE_ENGINE_SFTP.equals(storageSettings.engine())) {
                 LOGGER.info("Configured SFTP endpoint: " + storageSettings.sftpEndpoint());
             } else if (STORAGE_ENGINE_WEBDAV.equals(storageSettings.engine())) {
@@ -179,7 +189,7 @@ public class app {
             List<DocumentRecord> documents = deduplicateDocuments(extractedDocuments);
 
             if (documents.isEmpty()) {
-                LOGGER.severe("No statewide rules/standards documents were found on the source page. The page format may have changed.");
+                LOGGER.severe("No rule-set documents were found from configured source pages. Skipping sync.");
                 System.exit(2);
             }
 
@@ -196,7 +206,8 @@ public class app {
                         previousMetadata,
                         updatedMetadata,
                         storageEngine,
-                        retainPreviousEnabled
+                        retainPreviousEnabled,
+                        webhookSettings
                 );
                 if (combinedPdfEnabled) {
                     CombinedBuildResult combinedBuild = buildCombinedPdfs(
@@ -302,6 +313,47 @@ public class app {
         return parseBooleanConfig(raw, TEXT_EXTRACTION_ENABLED_PROPERTY + "/" + TEXT_EXTRACTION_ENABLED_ENV);
     }
 
+    private static WebhookSettings resolveDownloadWebhookSettings() {
+        String webhookUrl = readConfig(
+                DOWNLOAD_WEBHOOK_URL_PROPERTY,
+                DOWNLOAD_WEBHOOK_URL_ENV,
+                null
+        );
+        if (webhookUrl == null || webhookUrl.isBlank()) {
+            return null;
+        }
+
+        int timeoutSeconds = DEFAULT_DOWNLOAD_WEBHOOK_TIMEOUT_SECONDS;
+        String timeoutRaw = readConfig(
+                DOWNLOAD_WEBHOOK_TIMEOUT_SECONDS_PROPERTY,
+                DOWNLOAD_WEBHOOK_TIMEOUT_SECONDS_ENV,
+                Integer.toString(DEFAULT_DOWNLOAD_WEBHOOK_TIMEOUT_SECONDS)
+        );
+        try {
+            timeoutSeconds = parsePositiveInt(
+                    timeoutRaw,
+                    DOWNLOAD_WEBHOOK_TIMEOUT_SECONDS_PROPERTY + "/" + DOWNLOAD_WEBHOOK_TIMEOUT_SECONDS_ENV
+            );
+        } catch (IllegalArgumentException ex) {
+            LOGGER.warning(
+                    "Invalid webhook timeout '" + timeoutRaw + "'. Using default "
+                    + DEFAULT_DOWNLOAD_WEBHOOK_TIMEOUT_SECONDS + " seconds.");
+        }
+
+        try {
+            URI targetUri = URI.create(webhookUrl.trim());
+            String scheme = targetUri.getScheme();
+            if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
+                LOGGER.warning("Download webhook URL must use http/https. Ignoring value: " + webhookUrl);
+                return null;
+            }
+            return new WebhookSettings(targetUri, Duration.ofSeconds(timeoutSeconds));
+        } catch (IllegalArgumentException ex) {
+            LOGGER.warning("Ignoring invalid download webhook URL '" + webhookUrl + "': " + ex.getMessage());
+            return null;
+        }
+    }
+
     private static StorageEngine createStorageEngine(StorageSettings settings) throws IOException {
         if (STORAGE_ENGINE_SFTP.equals(settings.engine())) {
             return new SftpStorageEngine(settings);
@@ -371,19 +423,27 @@ public class app {
     }
 
     private static List<DocumentRecord> extractDocumentRecordsFromAllSources(HttpClient httpClient)
-            throws IOException, InterruptedException {
+            throws InterruptedException {
         List<DocumentRecord> records = new ArrayList<>();
 
-        String texasHtml = fetchHtml(httpClient, SOURCE_PAGE_URI);
-        records.addAll(extractDocumentRecords(texasHtml, SOURCE_PAGE_URI));
+        try {
+            String texasHtml = fetchHtml(httpClient, SOURCE_PAGE_URI);
+            records.addAll(extractDocumentRecords(texasHtml, SOURCE_PAGE_URI));
+        } catch (IOException | RuntimeException ex) {
+            LOGGER.log(Level.WARNING, "Unable to process Texas source page. Continuing with remaining sources.", ex);
+        }
 
         for (URI federalSourceUri : FEDERAL_SOURCE_PAGE_URIS) {
-            String federalHtml = fetchHtml(httpClient, federalSourceUri);
-            List<DocumentRecord> federalRecords = extractFederalRulePageRecords(federalHtml, federalSourceUri);
-            if (federalRecords.isEmpty()) {
-                LOGGER.warning("No federal rule-set link extracted from page: " + federalSourceUri);
+            try {
+                String federalHtml = fetchHtml(httpClient, federalSourceUri);
+                List<DocumentRecord> federalRecords = extractFederalRulePageRecords(federalHtml, federalSourceUri);
+                if (federalRecords.isEmpty()) {
+                    LOGGER.warning("No federal rule-set link extracted from page: " + federalSourceUri);
+                }
+                records.addAll(federalRecords);
+            } catch (IOException | RuntimeException ex) {
+                LOGGER.log(Level.WARNING, "Unable to process federal source page '" + federalSourceUri + "'. Continuing.", ex);
             }
-            records.addAll(federalRecords);
         }
 
         return records;
@@ -394,7 +454,7 @@ public class app {
         HttpRequest request = HttpRequest.newBuilder(sourceUri)
                 .GET()
                 .timeout(Duration.ofSeconds(45))
-                .header("User-Agent", HTTP_USER_AGENT)
+                .header("User-Agent", SOURCE_PAGE_USER_AGENT)
                 .header("Accept", "text/html,application/xhtml+xml")
                 .build();
 
@@ -607,7 +667,8 @@ public class app {
             Properties previousMetadata,
             Properties updatedMetadata,
             StorageEngine storageEngine,
-            boolean retainPreviousEnabled
+            boolean retainPreviousEnabled,
+            WebhookSettings webhookSettings
     ) throws IOException, InterruptedException {
         int downloaded = 0;
         int updated = 0;
@@ -698,6 +759,7 @@ public class app {
                         updatedDocumentIds.add(document.id());
                     }
                     LOGGER.info("  Result: download+store succeeded (" + bytes.length + " bytes)");
+                    sendDownloadWebhook(httpClient, webhookSettings, document, isUpdate, md5NewVersion, bytes.length);
                     updateMetadataEntry(
                             updatedMetadata,
                             metadataPrefix,
@@ -710,6 +772,7 @@ public class app {
                 } catch (IOException | InterruptedException ex) {
                     failed++;
                     LOGGER.log(Level.SEVERE, "  Result: download+store failed for '" + document.title() + "'", ex);
+                    LOGGER.warning("  Continuing with remaining rule sets after failure.");
                     preservePreviousMetadata(
                             updatedMetadata,
                             previousMetadata,
@@ -1324,7 +1387,7 @@ public class app {
         HttpRequest request = HttpRequest.newBuilder(documentUri)
                 .GET()
                 .timeout(Duration.ofSeconds(90))
-                .header("User-Agent", HTTP_USER_AGENT)
+                .header("User-Agent", DOWNLOAD_USER_AGENT)
                 .header("Accept", "application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,*/*")
                 .build();
 
@@ -1339,6 +1402,128 @@ public class app {
             throw new IOException("Download returned empty content for " + documentUri);
         }
         return body;
+    }
+
+    private static void sendDownloadWebhook(
+            HttpClient httpClient,
+            WebhookSettings webhookSettings,
+            DocumentRecord document,
+            boolean isUpdate,
+            String md5NewVersion,
+            int fileSizeBytes
+    ) {
+        if (webhookSettings == null || document == null) {
+            return;
+        }
+
+        String requestUrl = appendQueryParam(webhookSettings.targetUri(), "rulesetName", document.title());
+        String payload = buildWebhookPayload(document, isUpdate, md5NewVersion, fileSizeBytes);
+
+        HttpRequest request;
+        try {
+            request = HttpRequest.newBuilder(URI.create(requestUrl))
+                    .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
+                    .timeout(webhookSettings.timeout())
+                    .header("User-Agent", DOWNLOAD_USER_AGENT)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json,*/*")
+                    .build();
+        } catch (IllegalArgumentException ex) {
+            LOGGER.warning("  Webhook skipped due to invalid target URL: " + requestUrl + " (" + ex.getMessage() + ")");
+            return;
+        }
+
+        try {
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            int statusCode = response.statusCode();
+            if (statusCode >= 200 && statusCode < 300) {
+                LOGGER.info("  Webhook notification sent for '" + document.title() + "' (HTTP " + statusCode + ").");
+            } else {
+                LOGGER.warning("  Webhook failed for '" + document.title() + "' (HTTP " + statusCode + "). Continuing.");
+            }
+        } catch (IOException ex) {
+            LOGGER.warning("  Webhook failed for '" + document.title() + "': " + describeError(ex) + ". Continuing.");
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            LOGGER.warning("  Webhook interrupted for '" + document.title() + "'. Continuing without webhook delivery.");
+        }
+    }
+
+    private static String buildWebhookPayload(
+            DocumentRecord document,
+            boolean isUpdate,
+            String md5NewVersion,
+            int fileSizeBytes
+    ) {
+        StringBuilder json = new StringBuilder();
+        json.append("{");
+        json.append("\"rulesetName\":\"").append(escapeJson(document.title())).append("\",");
+        json.append("\"rulesetId\":\"").append(escapeJson(document.id())).append("\",");
+        json.append("\"isUpdate\":").append(isUpdate).append(",");
+        json.append("\"downloadUrl\":\"").append(escapeJson(document.downloadUri().toString())).append("\",");
+        json.append("\"storedFileName\":\"").append(escapeJson(document.fileName())).append("\",");
+        json.append("\"lastAmended\":\"").append(escapeJson(safeValue(document.lastAmendedRaw()))).append("\",");
+        json.append("\"md5\":\"").append(escapeJson(safeValue(md5NewVersion))).append("\",");
+        json.append("\"fileSizeBytes\":").append(fileSizeBytes).append(",");
+        json.append("\"downloadedAt\":\"").append(escapeJson(Instant.now().toString())).append("\"");
+        json.append("}");
+        return json.toString();
+    }
+
+    private static String appendQueryParam(URI baseUri, String key, String value) {
+        String base = baseUri.toString();
+        String fragment = "";
+        int hashIndex = base.indexOf('#');
+        if (hashIndex >= 0) {
+            fragment = base.substring(hashIndex);
+            base = base.substring(0, hashIndex);
+        }
+
+        String delimiter = base.contains("?") ? "&" : "?";
+        return base
+                + delimiter
+                + URLEncoder.encode(key, StandardCharsets.UTF_8)
+                + "="
+                + URLEncoder.encode(value == null ? "" : value, StandardCharsets.UTF_8)
+                + fragment;
+    }
+
+    private static String escapeJson(String value) {
+        if (value == null) {
+            return "";
+        }
+        StringBuilder escaped = new StringBuilder(value.length() + 16);
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            switch (c) {
+                case '\\' -> escaped.append("\\\\");
+                case '"' -> escaped.append("\\\"");
+                case '\b' -> escaped.append("\\b");
+                case '\f' -> escaped.append("\\f");
+                case '\n' -> escaped.append("\\n");
+                case '\r' -> escaped.append("\\r");
+                case '\t' -> escaped.append("\\t");
+                default -> {
+                    if (c < 0x20) {
+                        escaped.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        escaped.append(c);
+                    }
+                }
+            }
+        }
+        return escaped.toString();
+    }
+
+    private static String describeError(Throwable throwable) {
+        if (throwable == null) {
+            return "unknown error";
+        }
+        String message = throwable.getMessage();
+        if (message == null || message.isBlank()) {
+            return throwable.toString();
+        }
+        return message;
     }
 
     private static void updateMetadataEntry(
@@ -2317,6 +2502,9 @@ public class app {
         private static boolean isSuccessStatus(int statusCode) {
             return statusCode >= 200 && statusCode < 300;
         }
+    }
+
+    private record WebhookSettings(URI targetUri, Duration timeout) {
     }
 
     private record CombinedBuildResult(
