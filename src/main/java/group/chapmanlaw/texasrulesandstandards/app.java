@@ -72,12 +72,42 @@ import org.xml.sax.SAXException;
 public class app {
 
     private static final URI SOURCE_PAGE_URI = URI.create("https://www.txcourts.gov/rules-forms/rules-standards/");
+    private static final URI FEDERAL_APPELLATE_SOURCE_URI = URI.create(
+            "https://www.uscourts.gov/forms-rules/current-rules-practice-procedure/federal-rules-appellate-procedure");
+    private static final URI FEDERAL_BANKRUPTCY_SOURCE_URI = URI.create(
+            "https://www.uscourts.gov/forms-rules/current-rules-practice-procedure/federal-rules-bankruptcy-procedure");
+    private static final URI FEDERAL_CIVIL_SOURCE_URI = URI.create(
+            "https://www.uscourts.gov/forms-rules/current-rules-practice-procedure/federal-rules-civil-procedure");
+    private static final URI FEDERAL_CRIMINAL_SOURCE_URI = URI.create(
+            "https://www.uscourts.gov/forms-rules/current-rules-practice-procedure/federal-rules-criminal-procedure");
+    private static final URI FEDERAL_EVIDENCE_SOURCE_URI = URI.create(
+            "https://www.uscourts.gov/forms-rules/current-rules-practice-procedure/federal-rules-evidence");
+    private static final URI FEDERAL_2254_2255_SOURCE_URI = URI.create(
+            "https://www.uscourts.gov/forms-rules/current-rules-practice-procedure/rules-governing-section-2254-and-section-2255-proceedings");
+    private static final List<URI> FEDERAL_SOURCE_PAGE_URIS = List.of(
+            FEDERAL_APPELLATE_SOURCE_URI,
+            FEDERAL_BANKRUPTCY_SOURCE_URI,
+            FEDERAL_CIVIL_SOURCE_URI,
+            FEDERAL_CRIMINAL_SOURCE_URI,
+            FEDERAL_EVIDENCE_SOURCE_URI,
+            FEDERAL_2254_2255_SOURCE_URI
+    );
+    private static final List<URI> TRACKED_SOURCE_PAGE_URIS = List.of(
+            SOURCE_PAGE_URI,
+            FEDERAL_APPELLATE_SOURCE_URI,
+            FEDERAL_BANKRUPTCY_SOURCE_URI,
+            FEDERAL_CIVIL_SOURCE_URI,
+            FEDERAL_CRIMINAL_SOURCE_URI,
+            FEDERAL_EVIDENCE_SOURCE_URI,
+            FEDERAL_2254_2255_SOURCE_URI
+    );
     private static final Path DATA_DIRECTORY = Path.of("data");
     private static final Path METADATA_FILE = Path.of("rules-standards-metadata.properties");
     private static final Path LEGACY_METADATA_FILE = DATA_DIRECTORY.resolve("rules-standards-metadata.properties");
     private static final String LOG_FILE_PATTERN = Path.of("rules-standards-%g.log").toString();
     private static final int LOG_FILE_LIMIT_BYTES = 1_048_576;
     private static final int LOG_FILE_ROTATION_COUNT = 5;
+    private static final String FEDERAL_SECTION_KEY = "federal-rules";
     private static final String RULES_SECTION_HEADING = "Statewide Rules";
     private static final String STANDARDS_SECTION_HEADING = "Statewide Standards";
     private static final String STORAGE_ENGINE_LOCAL = "local";
@@ -100,6 +130,9 @@ public class app {
     private static final String HTTP_USER_AGENT = "texas-rules-and-standards-sync/1.0 (+https://www.txcourts.gov/)";
     private static final Pattern DATE_PATTERN = Pattern.compile(
             "(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{1,2},\\s+\\d{4}");
+    private static final Pattern LAST_AMENDED_PATTERN = Pattern.compile(
+            "(?i)last\\s+amended(?:\\s+in|\\s+on|\\s*[:\\-])?\\s*((?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{1,2},\\s+\\d{4}|\\d{4})");
+    private static final Pattern FEDERAL_DOWNLOAD_PATH_PATTERN = Pattern.compile("(?i).*/file/\\d+/download(?:\\?.*)?$");
     private static final Pattern HTML_ANCHOR_PATTERN = Pattern.compile(
             "<a\\b[^>]*href\\s*=\\s*['\"]([^'\"]+)['\"][^>]*>(.*?)</a>",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
@@ -116,7 +149,8 @@ public class app {
             configureLogging();
 
             LOGGER.info("Starting Texas rules and standards sync.");
-            LOGGER.info("Source page: " + SOURCE_PAGE_URI);
+            LOGGER.info("Texas source page: " + SOURCE_PAGE_URI);
+            LOGGER.info("Federal source pages configured: " + FEDERAL_SOURCE_PAGE_URIS.size());
             LOGGER.info("Data directory: " + DATA_DIRECTORY.toAbsolutePath());
 
             StorageSettings storageSettings = resolveStorageSettings();
@@ -141,8 +175,7 @@ public class app {
                     .connectTimeout(Duration.ofSeconds(30))
                     .build();
 
-            String html = fetchHtml(httpClient, SOURCE_PAGE_URI);
-            List<DocumentRecord> extractedDocuments = extractDocumentRecords(html, SOURCE_PAGE_URI);
+            List<DocumentRecord> extractedDocuments = extractDocumentRecordsFromAllSources(httpClient);
             List<DocumentRecord> documents = deduplicateDocuments(extractedDocuments);
 
             if (documents.isEmpty()) {
@@ -337,8 +370,27 @@ public class app {
         );
     }
 
+    private static List<DocumentRecord> extractDocumentRecordsFromAllSources(HttpClient httpClient)
+            throws IOException, InterruptedException {
+        List<DocumentRecord> records = new ArrayList<>();
+
+        String texasHtml = fetchHtml(httpClient, SOURCE_PAGE_URI);
+        records.addAll(extractDocumentRecords(texasHtml, SOURCE_PAGE_URI));
+
+        for (URI federalSourceUri : FEDERAL_SOURCE_PAGE_URIS) {
+            String federalHtml = fetchHtml(httpClient, federalSourceUri);
+            List<DocumentRecord> federalRecords = extractFederalRulePageRecords(federalHtml, federalSourceUri);
+            if (federalRecords.isEmpty()) {
+                LOGGER.warning("No federal rule-set link extracted from page: " + federalSourceUri);
+            }
+            records.addAll(federalRecords);
+        }
+
+        return records;
+    }
+
     private static String fetchHtml(HttpClient httpClient, URI sourceUri) throws IOException, InterruptedException {
-        LOGGER.info("Fetching source page HTML.");
+        LOGGER.info("Fetching source page HTML: " + sourceUri);
         HttpRequest request = HttpRequest.newBuilder(sourceUri)
                 .GET()
                 .timeout(Duration.ofSeconds(45))
@@ -352,17 +404,17 @@ public class app {
             throw new IOException("Failed to fetch source page. HTTP status " + statusCode);
         }
 
-        LOGGER.info("Fetched source page HTML successfully (HTTP " + statusCode + ").");
+        LOGGER.info("Fetched source page HTML successfully for " + sourceUri + " (HTTP " + statusCode + ").");
         return response.body();
     }
 
     private static List<DocumentRecord> extractDocumentRecords(String html, URI sourcePage) {
-        LOGGER.info("Extracting links and last amended dates from the page.");
+        LOGGER.info("Extracting links and last amended dates from source page: " + sourcePage);
         Document document = Jsoup.parse(html, sourcePage.toString());
         List<DocumentRecord> records = new ArrayList<>();
 
-        records.addAll(extractSectionRecords(document, RULES_SECTION_HEADING, "rules"));
-        records.addAll(extractSectionRecords(document, STANDARDS_SECTION_HEADING, "standards"));
+        records.addAll(extractSectionRecords(document, RULES_SECTION_HEADING, "rules", sourcePage));
+        records.addAll(extractSectionRecords(document, STANDARDS_SECTION_HEADING, "standards", sourcePage));
 
         if (records.isEmpty()) {
             LOGGER.warning("Structured extraction returned no records. Trying HTML fallback extraction for CSS/JS markup changes.");
@@ -372,7 +424,97 @@ public class app {
         return records;
     }
 
-    private static List<DocumentRecord> extractSectionRecords(Document document, String sectionHeading, String sectionKey) {
+    private static List<DocumentRecord> extractFederalRulePageRecords(String html, URI sourcePage) {
+        LOGGER.info("Extracting federal rule-set link from source page: " + sourcePage);
+        Document document = Jsoup.parse(html, sourcePage.toString());
+
+        Element heading = document.selectFirst("h1");
+        if (heading == null) {
+            LOGGER.warning("Could not find an H1 title on federal source page: " + sourcePage);
+            return Collections.emptyList();
+        }
+
+        String title = normalizeWhitespace(heading.text());
+        if (title.isBlank()) {
+            LOGGER.warning("H1 title is blank on federal source page: " + sourcePage);
+            return Collections.emptyList();
+        }
+
+        Element contentContainer = document.selectFirst("div.field--name-body");
+        if (contentContainer == null) {
+            contentContainer = document.selectFirst("main");
+        }
+
+        List<SectionToken> tokens = new ArrayList<>();
+        if (contentContainer != null) {
+            collectSectionTokens(contentContainer, tokens);
+        }
+        if (tokens.isEmpty()) {
+            collectSectionTokens(document, tokens);
+        }
+
+        int anchorIndex = findPreferredFederalAnchorIndex(tokens, title);
+        if (anchorIndex < 0) {
+            LOGGER.warning("No downloadable rule-set link found near page heading '" + title + "' on " + sourcePage);
+            return Collections.emptyList();
+        }
+
+        SectionToken anchorToken = tokens.get(anchorIndex);
+        URI documentUri = resolveUri(sourcePage, anchorToken.href());
+        if (documentUri == null) {
+            LOGGER.warning("Skipping federal source due to invalid document URI: " + anchorToken.href());
+            return Collections.emptyList();
+        }
+
+        String lastAmended = findDateNearby(tokens, anchorIndex);
+        if (lastAmended == null) {
+            String bodyText = contentContainer != null ? contentContainer.text() : document.text();
+            lastAmended = extractDateText(normalizeWhitespace(bodyText));
+        }
+        LocalDate lastAmendedDate = parseLastAmended(lastAmended);
+
+        DocumentRecord record = buildDocumentRecord(title, documentUri, FEDERAL_SECTION_KEY, lastAmended, lastAmendedDate);
+        LOGGER.info("Federal source page yielded 1 candidate document: " + title);
+        return List.of(record);
+    }
+
+    private static int findPreferredFederalAnchorIndex(List<SectionToken> tokens, String headingTitle) {
+        String normalizedHeadingTitle = normalizeWhitespace(headingTitle).toLowerCase(Locale.US);
+        int firstDownloadableAnchorIndex = -1;
+
+        for (int i = 0; i < tokens.size(); i++) {
+            SectionToken token = tokens.get(i);
+            if (token.type() != TokenType.ANCHOR || !looksLikeDocumentUrl(token.href())) {
+                continue;
+            }
+
+            if (firstDownloadableAnchorIndex < 0) {
+                firstDownloadableAnchorIndex = i;
+            }
+
+            String anchorText = normalizeWhitespace(token.text()).toLowerCase(Locale.US);
+            if (anchorText.isBlank()) {
+                continue;
+            }
+
+            if (anchorText.equals(normalizedHeadingTitle) || anchorText.contains(normalizedHeadingTitle)) {
+                return i;
+            }
+
+            if (normalizedHeadingTitle.contains("2254") && anchorText.contains("2254")) {
+                return i;
+            }
+        }
+
+        return firstDownloadableAnchorIndex;
+    }
+
+    private static List<DocumentRecord> extractSectionRecords(
+            Document document,
+            String sectionHeading,
+            String sectionKey,
+            URI sourcePage
+    ) {
         Element heading = findHeadingByText(document, sectionHeading);
         if (heading == null) {
             LOGGER.warning("Could not find section heading: " + sectionHeading);
@@ -407,7 +549,7 @@ public class app {
 
             String lastAmended = findDateNearby(tokens, i);
             LocalDate lastAmendedDate = parseLastAmended(lastAmended);
-            URI documentUri = resolveUri(SOURCE_PAGE_URI, token.href());
+            URI documentUri = resolveUri(sourcePage, token.href());
             if (documentUri == null) {
                 LOGGER.warning("Skipping anchor with invalid URI: " + token.href());
                 continue;
@@ -599,6 +741,7 @@ public class app {
         updatedMetadata.setProperty("tracked.ids", String.join(",", ids));
         updatedMetadata.setProperty("tracked.count", Integer.toString(ids.size()));
         updatedMetadata.setProperty("source.page", SOURCE_PAGE_URI.toString());
+        updatedMetadata.setProperty("source.pages", joinUris(TRACKED_SOURCE_PAGE_URIS));
         updatedMetadata.setProperty("source.lastCheckedAt", Instant.now().toString());
 
         return new SyncStats(downloaded, updated, skipped, failed, updatedDocumentIds);
@@ -1312,11 +1455,14 @@ public class app {
         if (href == null || href.isBlank()) {
             return false;
         }
-        String lower = href.toLowerCase(Locale.US);
+        String lower = href.trim().toLowerCase(Locale.US);
         for (String extension : DOCUMENT_EXTENSIONS) {
             if (lower.contains("." + extension)) {
                 return true;
             }
+        }
+        if (FEDERAL_DOWNLOAD_PATH_PATTERN.matcher(lower).matches()) {
+            return true;
         }
         return false;
     }
@@ -1360,19 +1506,33 @@ public class app {
         if (text == null || text.isBlank()) {
             return null;
         }
-        Matcher matcher = DATE_PATTERN.matcher(text);
-        if (!matcher.find()) {
-            return null;
+        Matcher lastAmendedMatcher = LAST_AMENDED_PATTERN.matcher(text);
+        if (lastAmendedMatcher.find()) {
+            return normalizeWhitespace(lastAmendedMatcher.group(1));
         }
-        return normalizeWhitespace(matcher.group());
+
+        Matcher matcher = DATE_PATTERN.matcher(text);
+        if (matcher.find()) {
+            return normalizeWhitespace(matcher.group());
+        }
+
+        return null;
     }
 
     private static LocalDate parseLastAmended(String lastAmended) {
         if (lastAmended == null || lastAmended.isBlank()) {
             return null;
         }
+        String normalized = lastAmended.trim();
+        if (normalized.matches("\\d{4}")) {
+            try {
+                return LocalDate.of(Integer.parseInt(normalized), 1, 1);
+            } catch (RuntimeException ignored) {
+                return null;
+            }
+        }
         try {
-            return LocalDate.parse(lastAmended.trim(), LAST_AMENDED_FORMAT);
+            return LocalDate.parse(normalized, LAST_AMENDED_FORMAT);
         } catch (DateTimeParseException ignored) {
             return null;
         }
@@ -1532,6 +1692,19 @@ public class app {
             }
         }
         return new ArrayList<>(deduplicated.values());
+    }
+
+    private static String joinUris(List<URI> uris) {
+        if (uris == null || uris.isEmpty()) {
+            return "";
+        }
+        List<String> values = new ArrayList<>();
+        for (URI uri : uris) {
+            if (uri != null) {
+                values.add(uri.toString());
+            }
+        }
+        return String.join(",", values);
     }
 
     private static int countDocumentIds(Properties metadata) {
