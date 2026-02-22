@@ -73,8 +73,9 @@ public class app {
 
     private static final URI SOURCE_PAGE_URI = URI.create("https://www.txcourts.gov/rules-forms/rules-standards/");
     private static final Path DATA_DIRECTORY = Path.of("data");
-    private static final Path METADATA_FILE = DATA_DIRECTORY.resolve("rules-standards-metadata.properties");
-    private static final String LOG_FILE_PATTERN = DATA_DIRECTORY.resolve("rules-standards-%g.log").toString();
+    private static final Path METADATA_FILE = Path.of("rules-standards-metadata.properties");
+    private static final Path LEGACY_METADATA_FILE = DATA_DIRECTORY.resolve("rules-standards-metadata.properties");
+    private static final String LOG_FILE_PATTERN = Path.of("rules-standards-%g.log").toString();
     private static final int LOG_FILE_LIMIT_BYTES = 1_048_576;
     private static final int LOG_FILE_ROTATION_COUNT = 5;
     private static final String RULES_SECTION_HEADING = "Statewide Rules";
@@ -82,6 +83,12 @@ public class app {
     private static final String STORAGE_ENGINE_LOCAL = "local";
     private static final String STORAGE_ENGINE_SFTP = "sftp";
     private static final String STORAGE_ENGINE_WEBDAV = "webdav";
+    private static final String COMBINED_PDF_ENABLED_PROPERTY = "combined.pdf.enabled";
+    private static final String COMBINED_PDF_ENABLED_ENV = "COMBINED_PDF_ENABLED";
+    private static final boolean DEFAULT_COMBINED_PDF_ENABLED = false;
+    private static final String TEXT_EXTRACTION_ENABLED_PROPERTY = "text.extraction.enabled";
+    private static final String TEXT_EXTRACTION_ENABLED_ENV = "TEXT_EXTRACTION_ENABLED";
+    private static final boolean DEFAULT_TEXT_EXTRACTION_ENABLED = false;
     private static final String TEXT_OUTPUT_DIRECTORY = "txt";
     private static final String COMBINED_NEW_FILE_NAME = "combined_new.pdf";
     private static final String COMBINED_PREVIOUS_FILE_NAME = "combined_previous.pdf";
@@ -109,7 +116,11 @@ public class app {
             LOGGER.info("Data directory: " + DATA_DIRECTORY.toAbsolutePath());
 
             StorageSettings storageSettings = resolveStorageSettings();
+            boolean combinedPdfEnabled = resolveCombinedPdfEnabled();
+            boolean textExtractionEnabled = resolveTextExtractionEnabled();
             LOGGER.info("Configured storage engine: " + storageSettings.engine());
+            LOGGER.info("Configured combined PDF generation: " + (combinedPdfEnabled ? "enabled" : "disabled"));
+            LOGGER.info("Configured text extraction: " + (textExtractionEnabled ? "enabled" : "disabled"));
             if (STORAGE_ENGINE_SFTP.equals(storageSettings.engine())) {
                 LOGGER.info("Configured SFTP endpoint: " + storageSettings.sftpEndpoint());
             } else if (STORAGE_ENGINE_WEBDAV.equals(storageSettings.engine())) {
@@ -141,14 +152,26 @@ public class app {
 
                 Properties updatedMetadata = new Properties();
                 SyncStats stats = syncDocuments(httpClient, documents, previousMetadata, updatedMetadata, storageEngine);
-                CombinedBuildResult combinedBuild = buildCombinedPdfs(
-                        documents,
-                        storageEngine,
-                        stats.downloaded() > 0,
-                        stats.updatedDocumentIds()
-                );
-                applyCombinedMetadata(updatedMetadata, combinedBuild, previousMetadata);
-                extractPdfTextArtifacts(documents, storageEngine, updatedMetadata, previousMetadata);
+                if (combinedPdfEnabled) {
+                    CombinedBuildResult combinedBuild = buildCombinedPdfs(
+                            documents,
+                            storageEngine,
+                            stats.downloaded() > 0,
+                            stats.updatedDocumentIds()
+                    );
+                    applyCombinedMetadata(updatedMetadata, combinedBuild, previousMetadata);
+                } else {
+                    LOGGER.info("Skipping combined PDF generation; combined PDF output is disabled.");
+                    applyCombinedMetadata(updatedMetadata, CombinedBuildResult.none(), previousMetadata);
+                }
+                if (textExtractionEnabled) {
+                    extractPdfTextArtifacts(documents, storageEngine, updatedMetadata, previousMetadata);
+                } else {
+                    LOGGER.info("Skipping .txt extraction artifacts; text extraction is disabled.");
+                    preserveTextArtifactMetadata(updatedMetadata, previousMetadata);
+                }
+                updatedMetadata.setProperty(COMBINED_PDF_ENABLED_PROPERTY, Boolean.toString(combinedPdfEnabled));
+                updatedMetadata.setProperty(TEXT_EXTRACTION_ENABLED_PROPERTY, Boolean.toString(textExtractionEnabled));
                 updatedMetadata.setProperty("storage.engine", storageEngine.name());
                 updatedMetadata.setProperty("storage.root", storageEngine.describeRoot());
                 writeMetadata(updatedMetadata);
@@ -198,6 +221,24 @@ public class app {
                 "Unsupported storage engine '" + configuredEngine + "'. Supported values: local, sftp, webdav.");
     }
 
+    private static boolean resolveCombinedPdfEnabled() {
+        String raw = readConfig(
+                COMBINED_PDF_ENABLED_PROPERTY,
+                COMBINED_PDF_ENABLED_ENV,
+                Boolean.toString(DEFAULT_COMBINED_PDF_ENABLED)
+        );
+        return parseBooleanConfig(raw, COMBINED_PDF_ENABLED_PROPERTY + "/" + COMBINED_PDF_ENABLED_ENV);
+    }
+
+    private static boolean resolveTextExtractionEnabled() {
+        String raw = readConfig(
+                TEXT_EXTRACTION_ENABLED_PROPERTY,
+                TEXT_EXTRACTION_ENABLED_ENV,
+                Boolean.toString(DEFAULT_TEXT_EXTRACTION_ENABLED)
+        );
+        return parseBooleanConfig(raw, TEXT_EXTRACTION_ENABLED_PROPERTY + "/" + TEXT_EXTRACTION_ENABLED_ENV);
+    }
+
     private static StorageEngine createStorageEngine(StorageSettings settings) throws IOException {
         if (STORAGE_ENGINE_SFTP.equals(settings.engine())) {
             return new SftpStorageEngine(settings);
@@ -232,11 +273,21 @@ public class app {
 
     private static Properties loadMetadata() throws IOException {
         Properties metadata = new Properties();
-        if (!Files.exists(METADATA_FILE)) {
+        Path metadataSource = METADATA_FILE;
+        if (!Files.exists(metadataSource)) {
+            if (Files.exists(LEGACY_METADATA_FILE)) {
+                metadataSource = LEGACY_METADATA_FILE;
+                LOGGER.info("Using legacy metadata path: " + LEGACY_METADATA_FILE.toAbsolutePath());
+            } else {
+                return metadata;
+            }
+        }
+
+        if (!Files.exists(metadataSource)) {
             return metadata;
         }
 
-        String raw = Files.readString(METADATA_FILE, StandardCharsets.UTF_8);
+        String raw = Files.readString(metadataSource, StandardCharsets.UTF_8);
         try (StringReader reader = new StringReader(raw)) {
             metadata.load(reader);
         }
@@ -893,6 +944,24 @@ public class app {
         );
     }
 
+    private static void preserveTextArtifactMetadata(Properties updatedMetadata, Properties previousMetadata) {
+        for (String key : previousMetadata.stringPropertyNames()) {
+            if (isTextArtifactMetadataKey(key)) {
+                updatedMetadata.setProperty(key, previousMetadata.getProperty(key, ""));
+            }
+        }
+    }
+
+    private static boolean isTextArtifactMetadataKey(String key) {
+        if (key == null || key.isBlank()) {
+            return false;
+        }
+        if (key.startsWith("combined.new.txt.") || key.startsWith("combined.previous.txt.")) {
+            return true;
+        }
+        return key.startsWith("doc.") && (key.contains(".txt.new.") || key.contains(".txt.previous."));
+    }
+
     private static void ensureTextArtifact(
             StorageEngine storageEngine,
             Properties updatedMetadata,
@@ -1425,6 +1494,21 @@ public class app {
         } catch (NumberFormatException ex) {
             throw new IllegalArgumentException("Setting '" + settingLabel + "' must be an integer. Got: " + rawValue, ex);
         }
+    }
+
+    private static boolean parseBooleanConfig(String rawValue, String settingLabel) {
+        if (rawValue == null || rawValue.isBlank()) {
+            throw new IllegalArgumentException("Setting '" + settingLabel + "' cannot be empty.");
+        }
+        String normalized = rawValue.trim().toLowerCase(Locale.US);
+        if ("true".equals(normalized) || "1".equals(normalized) || "yes".equals(normalized) || "on".equals(normalized)) {
+            return true;
+        }
+        if ("false".equals(normalized) || "0".equals(normalized) || "no".equals(normalized) || "off".equals(normalized)) {
+            return false;
+        }
+        throw new IllegalArgumentException(
+                "Setting '" + settingLabel + "' must be one of: true,false,1,0,yes,no,on,off. Got: " + rawValue);
     }
 
     private static String normalizeRemoteDirectory(String remoteDirectory) {
