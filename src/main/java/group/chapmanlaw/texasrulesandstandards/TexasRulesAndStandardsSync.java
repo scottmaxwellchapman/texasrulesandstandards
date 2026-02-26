@@ -70,7 +70,7 @@ import org.jsoup.nodes.Node;
 import org.jsoup.nodes.TextNode;
 import org.xml.sax.SAXException;
 
-public class app {
+public class TexasRulesAndStandardsSync {
 
     private static final URI SOURCE_PAGE_URI = URI.create("https://www.txcourts.gov/rules-forms/rules-standards/");
     private static final URI FEDERAL_APPELLATE_SOURCE_URI = URI.create(
@@ -102,7 +102,7 @@ public class app {
             FEDERAL_EVIDENCE_SOURCE_URI,
             FEDERAL_2254_2255_SOURCE_URI
     );
-    private static final Path DATA_DIRECTORY = Path.of("data");
+    private static final Path DATA_DIRECTORY = Path.of("texasrulesandstandards_data");
     private static final Path METADATA_FILE = Path.of("rules-standards-metadata.properties");
     private static final Path LEGACY_METADATA_FILE = DATA_DIRECTORY.resolve("rules-standards-metadata.properties");
     private static final String LOG_FILE_PATTERN = Path.of("rules-standards-%g.log").toString();
@@ -149,9 +149,13 @@ public class app {
     private static final float TOC_LINE_HEIGHT = 16f;
     private static final float TOC_TITLE_FONT_SIZE = 20f;
     private static final float TOC_ENTRY_FONT_SIZE = 12f;
-    private static final Logger LOGGER = Logger.getLogger(app.class.getName());
+    private static final Logger LOGGER = Logger.getLogger(TexasRulesAndStandardsSync.class.getName());
 
     public static void main(String[] args) {
+        System.exit(runSync());
+    }
+
+    public static int runSync() {
         try {
             Files.createDirectories(DATA_DIRECTORY);
             configureLogging();
@@ -190,7 +194,7 @@ public class app {
 
             if (documents.isEmpty()) {
                 LOGGER.severe("No rule-set documents were found from configured source pages. Skipping sync.");
-                System.exit(2);
+                return 2;
             }
 
             LOGGER.info("Discovered " + documents.size() + " candidate document(s) to track.");
@@ -248,9 +252,10 @@ public class app {
                         + ", failed=" + stats.failed());
                 LOGGER.info("Metadata written to " + METADATA_FILE.toAbsolutePath());
             }
+            return 0;
         } catch (Exception ex) {
             LOGGER.log(Level.SEVERE, "Sync failed.", ex);
-            System.exit(1);
+            return 1;
         }
     }
 
