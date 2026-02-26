@@ -2,6 +2,8 @@
 
 This project is a Java/Maven command-line tool that syncs Texas court rules and standards PDFs (plus selected federal rules pages), tracks metadata, optionally emits text extracts, and can publish artifacts to local disk, SFTP, or WebDAV.
 
+It can also be embedded and invoked from another Java application through `TexasRulesAndStandardsSync.runSync()`.
+
 ## What it does
 
 - Crawls the Texas Courts rules/standards page and discovers linked documents.
@@ -34,6 +36,20 @@ The shaded runnable jar is produced at:
 ```bash
 java -jar target/texasrulesandstandards-1.0-SNAPSHOT-fat.jar
 ```
+
+### Embed in another Java application
+
+```java
+import group.chapmanlaw.texasrulesandstandards.TexasRulesAndStandardsSync;
+
+int exitCode = TexasRulesAndStandardsSync.runSync();
+```
+
+`runSync()` returns:
+
+- `0` for success
+- `1` for execution failure
+- `2` when no rule documents were discovered
 
 You can also run with Maven:
 
@@ -92,6 +108,8 @@ Depending on settings and detected changes, the run will create/update artifacts
 - Text extracts under `txt/`
 - `rules-standards-metadata.properties`
 - Rotating log files matching `rules-standards-*.log`
+
+For local storage, artifacts are written under `texasrulesandstandards_data/`.
 
 ## Example
 
