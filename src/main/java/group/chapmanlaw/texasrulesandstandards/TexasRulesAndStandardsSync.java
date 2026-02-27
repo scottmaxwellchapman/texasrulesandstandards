@@ -150,13 +150,35 @@ public class TexasRulesAndStandardsSync {
     private static final float TOC_TITLE_FONT_SIZE = 20f;
     private static final float TOC_ENTRY_FONT_SIZE = 12f;
     private static final Logger LOGGER = Logger.getLogger(TexasRulesAndStandardsSync.class.getName());
+    private static final String DEFAULT_CONFIG_BASE_NAME = "texasrulesstandards_config";
+    private static final String DEFAULT_CONFIG_FILE_NAME = DEFAULT_CONFIG_BASE_NAME + ".properties";
+    private static final String CLI_CONFIG_PATH_OPTION = "--config";
+    private static volatile Properties loadedConfigProperties = new Properties();
 
     public static void main(String[] args) {
-        System.exit(runSync());
+        Path configPath = parseCliConfigPath(args);
+        if (configPath == null && args != null && args.length > 0) {
+            System.err.println("Usage: java -jar <jar-file> [--config <path>]");
+            System.exit(1);
+            return;
+        }
+        System.exit(runSync(configPath));
     }
 
     public static int runSync() {
+        return runSync((Path) null);
+    }
+
+    public static int runSync(String configPath) {
+        if (configPath == null || configPath.isBlank()) {
+            return runSync((Path) null);
+        }
+        return runSync(Path.of(configPath.trim()));
+    }
+
+    public static int runSync(Path configPath) {
         try {
+            loadedConfigProperties = loadConfigProperties(configPath);
             Files.createDirectories(DATA_DIRECTORY);
             configureLogging();
 
@@ -164,6 +186,7 @@ public class TexasRulesAndStandardsSync {
             LOGGER.info("Texas source page: " + SOURCE_PAGE_URI);
             LOGGER.info("Federal source pages configured: " + FEDERAL_SOURCE_PAGE_URIS.size());
             LOGGER.info("Data directory: " + DATA_DIRECTORY.toAbsolutePath());
+            LOGGER.info("Loaded config entries: " + loadedConfigProperties.size());
 
             StorageSettings storageSettings = resolveStorageSettings();
             boolean retainPreviousEnabled = resolveRetainPreviousEnabled();
@@ -1965,6 +1988,59 @@ public class TexasRulesAndStandardsSync {
         return value.trim().toLowerCase(Locale.US);
     }
 
+    private static Path parseCliConfigPath(String[] args) {
+        if (args == null || args.length == 0) {
+            return null;
+        }
+        if (args.length == 2 && CLI_CONFIG_PATH_OPTION.equals(args[0])) {
+            return Path.of(args[1]);
+        }
+        if (args.length == 1 && args[0] != null && args[0].startsWith(CLI_CONFIG_PATH_OPTION + "=")) {
+            return Path.of(args[0].substring((CLI_CONFIG_PATH_OPTION + "=").length()));
+        }
+        return null;
+    }
+
+    private static Properties loadConfigProperties(Path explicitConfigPath) throws IOException {
+        Path resolvedConfigPath = resolveConfigPath(explicitConfigPath);
+        if (resolvedConfigPath == null) {
+            return new Properties();
+        }
+
+        if (!Files.exists(resolvedConfigPath)) {
+            throw new IllegalArgumentException("Config file was not found: " + resolvedConfigPath.toAbsolutePath());
+        }
+
+        if (!Files.isRegularFile(resolvedConfigPath)) {
+            throw new IllegalArgumentException("Config path is not a file: " + resolvedConfigPath.toAbsolutePath());
+        }
+
+        Properties fileProperties = new Properties();
+        try (var reader = Files.newBufferedReader(resolvedConfigPath, StandardCharsets.UTF_8)) {
+            fileProperties.load(reader);
+        }
+
+        return fileProperties;
+    }
+
+    private static Path resolveConfigPath(Path explicitConfigPath) {
+        if (explicitConfigPath != null) {
+            return explicitConfigPath;
+        }
+
+        Path defaultPropertiesPath = Path.of(DEFAULT_CONFIG_FILE_NAME);
+        if (Files.exists(defaultPropertiesPath)) {
+            return defaultPropertiesPath;
+        }
+
+        Path defaultBasePath = Path.of(DEFAULT_CONFIG_BASE_NAME);
+        if (Files.exists(defaultBasePath)) {
+            return defaultBasePath;
+        }
+
+        return null;
+    }
+
     private static String readConfig(String propertyKey, String envKey, String defaultValue) {
         String propertyValue = System.getProperty(propertyKey);
         if (propertyValue != null && !propertyValue.isBlank()) {
@@ -1973,6 +2049,10 @@ public class TexasRulesAndStandardsSync {
         String envValue = System.getenv(envKey);
         if (envValue != null && !envValue.isBlank()) {
             return envValue.trim();
+        }
+        String fileValue = loadedConfigProperties.getProperty(propertyKey);
+        if (fileValue != null && !fileValue.isBlank()) {
+            return fileValue.trim();
         }
         return defaultValue;
     }
