@@ -153,16 +153,21 @@ public class TexasRulesAndStandardsSync {
     private static final String DEFAULT_CONFIG_BASE_NAME = "texasrulesstandards_config";
     private static final String DEFAULT_CONFIG_FILE_NAME = DEFAULT_CONFIG_BASE_NAME + ".properties";
     private static final String CLI_CONFIG_PATH_OPTION = "--config";
+    private static final String CLI_TIMER_INTERVAL_SECONDS_OPTION = "--timer-interval-seconds";
     private static volatile Properties loadedConfigProperties = new Properties();
 
     public static void main(String[] args) {
-        Path configPath = parseCliConfigPath(args);
-        if (configPath == null && args != null && args.length > 0) {
-            System.err.println("Usage: java -jar <jar-file> [--config <path>]");
+        CliArguments cliArguments = parseCliArguments(args);
+        if (!cliArguments.valid()) {
+            System.err.println("Usage: java -jar <jar-file> [--config <path>] [--timer-interval-seconds <seconds>]");
             System.exit(1);
             return;
         }
-        System.exit(runSync(configPath));
+        if (cliArguments.timerInterval() == null) {
+            System.exit(runSync(cliArguments.configPath()));
+            return;
+        }
+        System.exit(runSyncOnTimer(cliArguments.configPath(), cliArguments.timerInterval()));
     }
 
     public static int runSync() {
@@ -280,6 +285,38 @@ public class TexasRulesAndStandardsSync {
             LOGGER.log(Level.SEVERE, "Sync failed.", ex);
             return 1;
         }
+    }
+
+    public static int runSyncOnTimer(Duration interval) {
+        return runSyncOnTimer((Path) null, interval);
+    }
+
+    public static int runSyncOnTimer(String configPath, Duration interval) {
+        if (configPath == null || configPath.isBlank()) {
+            return runSyncOnTimer((Path) null, interval);
+        }
+        return runSyncOnTimer(Path.of(configPath.trim()), interval);
+    }
+
+    public static int runSyncOnTimer(Path configPath, Duration interval) {
+        validateTimerInterval(interval);
+        int lastFailureCode = 0;
+        long intervalMillis = interval.toMillis();
+        LOGGER.info("Recurring sync timer enabled with an interval of " + interval + ".");
+        while (!Thread.currentThread().isInterrupted()) {
+            int exitCode = runSync(configPath);
+            if (exitCode != 0) {
+                lastFailureCode = exitCode;
+            }
+            try {
+                Thread.sleep(intervalMillis);
+            } catch (InterruptedException interruptedException) {
+                Thread.currentThread().interrupt();
+                LOGGER.info("Recurring sync timer interrupted; shutting down.");
+                break;
+            }
+        }
+        return lastFailureCode;
     }
 
     private static StorageSettings resolveStorageSettings() {
@@ -1988,17 +2025,91 @@ public class TexasRulesAndStandardsSync {
         return value.trim().toLowerCase(Locale.US);
     }
 
-    private static Path parseCliConfigPath(String[] args) {
+    private static CliArguments parseCliArguments(String[] args) {
         if (args == null || args.length == 0) {
-            return null;
+            return CliArguments.valid(null, null);
         }
-        if (args.length == 2 && CLI_CONFIG_PATH_OPTION.equals(args[0])) {
-            return Path.of(args[1]);
+
+        Path configPath = null;
+        Duration timerInterval = null;
+
+        int index = 0;
+        while (index < args.length) {
+            String argument = args[index];
+            if (argument == null || argument.isBlank()) {
+                return CliArguments.invalid();
+            }
+
+            if (CLI_CONFIG_PATH_OPTION.equals(argument)) {
+                if (index + 1 >= args.length) {
+                    return CliArguments.invalid();
+                }
+                configPath = Path.of(args[index + 1]);
+                index += 2;
+                continue;
+            }
+
+            if (argument.startsWith(CLI_CONFIG_PATH_OPTION + "=")) {
+                configPath = Path.of(argument.substring((CLI_CONFIG_PATH_OPTION + "=").length()));
+                index++;
+                continue;
+            }
+
+            if (CLI_TIMER_INTERVAL_SECONDS_OPTION.equals(argument)) {
+                if (index + 1 >= args.length) {
+                    return CliArguments.invalid();
+                }
+                try {
+                    timerInterval = parseTimerIntervalSeconds(args[index + 1]);
+                } catch (IllegalArgumentException ex) {
+                    return CliArguments.invalid();
+                }
+                index += 2;
+                continue;
+            }
+
+            if (argument.startsWith(CLI_TIMER_INTERVAL_SECONDS_OPTION + "=")) {
+                try {
+                    timerInterval = parseTimerIntervalSeconds(argument.substring((CLI_TIMER_INTERVAL_SECONDS_OPTION + "=").length()));
+                } catch (IllegalArgumentException ex) {
+                    return CliArguments.invalid();
+                }
+                index++;
+                continue;
+            }
+
+            return CliArguments.invalid();
         }
-        if (args.length == 1 && args[0] != null && args[0].startsWith(CLI_CONFIG_PATH_OPTION + "=")) {
-            return Path.of(args[0].substring((CLI_CONFIG_PATH_OPTION + "=").length()));
+
+        return CliArguments.valid(configPath, timerInterval);
+    }
+
+    private static Duration parseTimerIntervalSeconds(String rawValue) {
+        int seconds = parsePositiveInt(rawValue, CLI_TIMER_INTERVAL_SECONDS_OPTION);
+        return Duration.ofSeconds(seconds);
+    }
+
+    private static void validateTimerInterval(Duration interval) {
+        if (interval == null) {
+            throw new IllegalArgumentException("Recurring timer interval is required.");
         }
-        return null;
+        if (interval.isZero() || interval.isNegative()) {
+            throw new IllegalArgumentException("Recurring timer interval must be greater than zero.");
+        }
+        if (interval.compareTo(Duration.ofMillis(1)) < 0) {
+            throw new IllegalArgumentException("Recurring timer interval must be at least 1 millisecond.");
+        }
+    }
+
+    private record CliArguments(Path configPath, Duration timerInterval, boolean valid) {
+
+        private static CliArguments valid(Path configPath, Duration timerInterval) {
+            return new CliArguments(configPath, timerInterval, true);
+        }
+
+        private static CliArguments invalid() {
+            return new CliArguments(null, null, false);
+        }
     }
 
     private static Properties loadConfigProperties(Path explicitConfigPath) throws IOException {
