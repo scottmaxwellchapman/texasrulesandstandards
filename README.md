@@ -37,12 +37,21 @@ The shaded runnable jar is produced at:
 java -jar target/texasrulesandstandards-1.0-SNAPSHOT-fat.jar
 ```
 
+To point the CLI to a specific config file path:
+
+```bash
+java -jar target/texasrulesandstandards-1.0-SNAPSHOT-fat.jar --config /path/to/config.properties
+```
+
 ### Embed in another Java application
 
 ```java
 import group.chapmanlaw.texasrulesandstandards.TexasRulesAndStandardsSync;
 
 int exitCode = TexasRulesAndStandardsSync.runSync();
+
+// Or point to a specific config file path
+int exitCodeWithConfig = TexasRulesAndStandardsSync.runSync("/path/to/config.properties");
 ```
 
 `runSync()` returns:
@@ -64,7 +73,14 @@ Configuration can be supplied via either:
 1. Java system properties (e.g., `-Dstorage.engine=sftp`), or
 2. Environment variables (e.g., `STORAGE_ENGINE=sftp`)
 
-System properties take precedence over environment variables.
+System properties take precedence over environment variables, and both override values in the config file when present.
+
+By default, the application looks for a config file in the working directory using this base name:
+
+- `texasrulesstandards_config.properties`
+- `texasrulesstandards_config`
+
+If neither file exists, only system properties and environment variables are used.
 
 ### Core settings
 
@@ -74,7 +90,7 @@ System properties take precedence over environment variables.
 | Keep previous version of PDFs | `retain.previous.enabled` | `RETAIN_PREVIOUS_ENABLED` | `false` |
 | Enable combined PDF generation | `combined.pdf.enabled` | `COMBINED_PDF_ENABLED` | `true` |
 | Download webhook URL | `download.webhook.url` | `DOWNLOAD_WEBHOOK_URL` | disabled |
-| Download webhook timeout (seconds) | `download.webhook.timeoutSeconds` | `DOWNLOAD_WEBHOOK_TIMEOUT_SECONDS` | `10` |
+| Download webhook timeout (seconds) | `download.webhook.timeoutSeconds` | `DOWNLOAD_WEBHOOK_TIMEOUT_SECONDS` | `15` |
 
 ### SFTP settings (when `storage.engine=sftp`)
 
