@@ -43,15 +43,25 @@ To point the CLI to a specific config file path:
 java -jar target/texasrulesandstandards-1.0-SNAPSHOT-fat.jar --config /path/to/config.properties
 ```
 
+To run continuously on a fixed timer interval (seconds):
+
+```bash
+java -jar target/texasrulesandstandards-1.0-SNAPSHOT-fat.jar --timer-interval-seconds 3600
+```
+
 ### Embed in another Java application
 
 ```java
 import group.chapmanlaw.texasrulesandstandards.TexasRulesAndStandardsSync;
+import java.time.Duration;
 
 int exitCode = TexasRulesAndStandardsSync.runSync();
 
 // Or point to a specific config file path
 int exitCodeWithConfig = TexasRulesAndStandardsSync.runSync("/path/to/config.properties");
+
+// Run continuously every hour
+int recurringExitCode = TexasRulesAndStandardsSync.runSyncOnTimer(Duration.ofHours(1));
 ```
 
 `runSync()` returns:
@@ -59,6 +69,8 @@ int exitCodeWithConfig = TexasRulesAndStandardsSync.runSync("/path/to/config.pro
 - `0` for success
 - `1` for execution failure
 - `2` when no rule documents were discovered
+
+`runSyncOnTimer(...)` runs `runSync(...)` repeatedly until the thread is interrupted. It returns `0` if every run succeeded, otherwise the last non-zero run exit code observed before shutdown.
 
 You can also run with Maven:
 
